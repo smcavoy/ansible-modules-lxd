@@ -61,23 +61,23 @@
           - c1_result is changed
           - c1_server.status == 404
           - c2_result is changed
-          - c2_result.trust_token | length > 0
+          - c2_result.link_token | length > 0
           - c2_result.pending is true
           - c2_result.link.type == 'bidirectional'
           - c3_result is not changed
-          - c3_result.trust_token is not defined
+          - c3_result.link_token is not defined
           - c3_result.pending is true
 
     - name: "CK1: activate the link on A with the token"
       smcavoy.lxd.lxd_cluster_link:
         name: "{{ on_a }}"
-        trust_token: "{{ c2_result.trust_token }}"
+        link_token: "{{ c2_result.link_token }}"
       register: ck1_result
 
     - name: "CK1: run the activation again"
       smcavoy.lxd.lxd_cluster_link:
         name: "{{ on_a }}"
-        trust_token: "{{ c2_result.trust_token }}"
+        link_token: "{{ c2_result.link_token }}"
       register: ck1_again
 
     - name: "CK1: read the link on B"
@@ -92,7 +92,7 @@
         that:
           - ck1_result is changed
           - ck1_result.pending is false
-          - ck1_result.trust_token is not defined
+          - ck1_result.link_token is not defined
           - ck1_again is not changed
           - ck1_b is not changed
           - ck1_b.pending is false
@@ -160,7 +160,7 @@
       smcavoy.lxd.lxd_cluster_link:
         name: "{{ on_a }}-x"
         type: public
-        trust_token: abc
+        link_token: abc
       register: b2_result
       ignore_errors: true
 
@@ -211,9 +211,9 @@
           - ck2_result is changed
           - ck2_result.link is none
           - ck2_result.pending is true
-          - ck2_result.trust_token | length > 0
+          - ck2_result.link_token | length > 0
           - ck2_again is not changed
-          - ck2_again.trust_token is not defined
+          - ck2_again.link_token is not defined
           - ck2_absent is changed
           - ck2_absent_again is not changed
 

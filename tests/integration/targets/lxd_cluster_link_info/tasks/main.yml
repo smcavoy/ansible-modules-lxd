@@ -26,7 +26,7 @@
     - name: Activate it on A
       smcavoy.lxd.lxd_cluster_link:
         name: "{{ on_a }}"
-        trust_token: "{{ pending.trust_token }}"
+        link_token: "{{ pending.link_token }}"
 
     - name: "I1: read all links on A"
       smcavoy.lxd.lxd_cluster_link_info:

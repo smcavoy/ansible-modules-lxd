@@ -396,8 +396,8 @@ LINK_IDENTITY = "/1.0/auth/identities/tls/site-b"
 @pytest.mark.parametrize(
     ("args", "text"),
     [
-        ({"type": "public", "trust_token": "abc"}, "trust_token and auth_groups are not for a public link"),
-        ({"type": "public", "auth_groups": ["g"]}, "trust_token and auth_groups are not for a public link"),
+        ({"type": "public", "link_token": "abc"}, "link_token and auth_groups are not for a public link"),
+        ({"type": "public", "auth_groups": ["g"]}, "link_token and auth_groups are not for a public link"),
         ({"remote_address": "192.0.2.9:8443"}, "remote_address and fingerprint are only for a public link"),
         ({"type": "unidirectional", "fingerprint": "0" * 64}, "remote_address and fingerprint are only for a public link"),
         ({"config": {"limits.x": "1"}}, "config key limits.x is not a user.* key"),
@@ -411,12 +411,20 @@ def test_cluster_link_refusals(lxd, run, args, text):
     assert lxd.writes() == []
 
 
+def test_cluster_link_warns_when_a_task_gives_only_the_connection_option_trust_token(server, run):
+    """A task from before 0.2.0 gave the link token as trust_token. It makes a pending link now, with a warning that says why."""
+    result = run(lxd_cluster_link, {"name": "site-b", "trust_token": "t0ken-fr0m-b"})
+    assert result["changed"] is True and result["pending"] is True, result
+    assert any("link_token since version 0.2.0" in str(warning) for warning in result.get("warnings", [])), result
+    assert [body for method, path, body in server.writes() if "trust_token" in (body or {})] == []
+
+
 def test_cluster_link_pending_then_updated_then_deleted(server, run):
     args = {"name": "site-b", "description": "link to B", "config": {"user.a": 1}, "auth_groups": ["links"]}
 
     result = run(lxd_cluster_link, args, check_mode=True)
     assert result["changed"] is True, result
-    assert result["pending"] is True and "trust_token" not in result
+    assert result["pending"] is True and "link_token" not in result
     assert server.writes() == []
 
     result = run(lxd_cluster_link, args)
@@ -426,14 +434,14 @@ def test_cluster_link_pending_then_updated_then_deleted(server, run):
     assert result["pending"] is True
     assert result["link"]["type"] == "bidirectional"
     # The token for the other cluster is the answer of LXD, as base64 of JSON.
-    assert decoded(result["trust_token"])["secret"] == "s3cret-1"
-    assert decoded(result["trust_token"])["client_name"] == "site-b"
+    assert decoded(result["link_token"])["secret"] == "s3cret-1"
+    assert decoded(result["link_token"])["client_name"] == "site-b"
 
     # A second run makes no second token.
     del server.requests[:]
     result = run(lxd_cluster_link, args)
     assert result["changed"] is False, result
-    assert result["pending"] is True and "trust_token" not in result
+    assert result["pending"] is True and "link_token" not in result
     assert server.writes() == []
 
     # The other cluster used the token: the link has addresses. An exact config keeps the volatile keys.
@@ -472,7 +480,7 @@ def test_cluster_link_pending_then_updated_then_deleted(server, run):
 
 
 def test_cluster_link_with_a_token_is_active_and_hides_the_token(server, run):
-    args = {"name": "site-b", "trust_token": "t0ken-fr0m-b"}
+    args = {"name": "site-b", "link_token": "t0ken-fr0m-b"}
     result = run(lxd_cluster_link, args, check_mode=True)
     assert result["changed"] is True and result["pending"] is False
     assert server.writes() == []
@@ -483,7 +491,7 @@ def test_cluster_link_with_a_token_is_active_and_hides_the_token(server, run):
         ("POST", "/1.0/cluster/links", {"name": "site-b", "type": "bidirectional", "description": "", "config": {}, "trust_token": "t0ken-fr0m-b"})
     ]
     assert result["pending"] is False
-    assert "trust_token" not in result
+    assert "link_token" not in result
     assert "t0ken-fr0m-b" not in json.dumps(result)
 
     del server.requests[:]
@@ -497,14 +505,14 @@ def test_cluster_link_pending_unidirectional_is_only_an_identity(server, run):
     result = run(lxd_cluster_link, args)
     assert result["changed"] is True, result
     assert result["link"] is None and result["pending"] is True
-    assert decoded(result["trust_token"])["secret"] == "s3cret-1"
+    assert decoded(result["link_token"])["secret"] == "s3cret-1"
     assert server.get(LINK) is None and server.get(LINK_IDENTITY) is not None
 
     del server.requests[:]
     result = run(lxd_cluster_link, args)
     assert result["changed"] is False, result
     assert result["msg"] == "a token for link site-b is already open"
-    assert result["pending"] is True and "trust_token" not in result
+    assert result["pending"] is True and "link_token" not in result
     assert server.writes() == []
 
     absent = {"name": "site-b", "state": "absent"}

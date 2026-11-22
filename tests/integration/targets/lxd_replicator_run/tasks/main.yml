@@ -76,7 +76,7 @@
     - name: "activate the link on A"
       smcavoy.lxd.lxd_cluster_link:
         name: "{{ link_a }}"
-        trust_token: "{{ pending.trust_token }}"
+        link_token: "{{ pending.link_token }}"
         auth_groups: ["{{ link_group }}"]
       no_log: true
 
