@@ -19,7 +19,7 @@ description = "Example tokens in the specs, cut short with ..."
 condition = "AND"
 regexTarget = "line"
 paths = ['''(^|/)docs/design/specs/lxd_(auth_identity|auth_identity_token|cluster_join_token|cluster_link|trust_token)\.md$''']
-regexes = ['''(join_token|trust_token|token): eyJ[A-Za-z0-9]{10,40}\.\.\.''']
+regexes = ['''(join_token|link_token|trust_token|token): eyJ[A-Za-z0-9]{10,40}\.\.\.''']
 
 # The cluster target joins with a wrong token to test the failure. The value is base64 of "not a token".
 [[rules.allowlists]]

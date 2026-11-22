@@ -1,0 +1,9 @@
+---
+breaking_changes:
+  - >-
+    lxd_cluster_link - the option ``trust_token`` and the return value ``trust_token`` have the new name ``link_token``.
+    The old name hid the connection option ``trust_token``, which adds the client certificate to the trust store of the
+    server; that option now works in this module as in every other module. Change ``trust_token`` to ``link_token`` in
+    tasks that activate a link, and ``result.trust_token`` to ``result.link_token`` where a task reads the token of a
+    pending link. A task that still gives only ``trust_token`` makes a pending link and gets a warning
+    (https://github.com/smcavoy/ansible-modules-lxd/pull/2).

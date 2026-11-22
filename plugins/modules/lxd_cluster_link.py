@@ -11,7 +11,7 @@ short_description: Manage links between LXD clusters
 version_added: "0.1.0"
 description:
   - Create, update, and delete links between two LXD clusters. A link is V(bidirectional), V(unidirectional), or V(public).
-  - A V(bidirectional) or V(unidirectional) link needs two tasks. The first task runs on cluster B without O(trust_token).
+  - A V(bidirectional) or V(unidirectional) link needs two tasks. The first task runs on cluster B without O(link_token).
     It makes a pending link and returns a token. The second task runs on cluster A with that token.
   - A V(public) link needs only cluster A. The module confirms it when O(fingerprint) matches the certificate of the other cluster.
 author:
@@ -48,11 +48,13 @@ options:
     type: str
     choices: ["bidirectional", "unidirectional", "public"]
     default: bidirectional
-  trust_token:
+  link_token:
     description:
       - The token from the pending link on the other cluster. With it, the module activates the link on both clusters.
       - Without it, the module makes a pending link and returns a new token.
       - The module uses it only when it creates the link. Not for V(public).
+      - Before version 0.2.0 this option had the name O(trust_token). That name is now only the connection option, which adds the
+        client certificate to the trust store of the server.
     type: str
   auth_groups:
     description:
@@ -110,7 +112,7 @@ EXAMPLES = r"""
   smcavoy.lxd.lxd_cluster_link:
     url: https://cluster-a:8443
     name: site-b
-    trust_token: "{{ pending.trust_token }}"
+    link_token: "{{ pending.link_token }}"
     auth_groups:
       - replicators
   no_log: true
@@ -138,7 +140,7 @@ link:
     config:
       volatile.addresses: 10.250.0.41:8443
     used_by: []
-trust_token:
+link_token:
   description:
     - The token for the other cluster. Only when the module makes a pending V(bidirectional) or V(unidirectional) link.
     - This is a secret.
@@ -196,11 +198,17 @@ class ClusterLinkModule:
         params = mod.params
         self.name: str = params["name"]
         self.path = api_path("cluster", "links", self.name)
-        if params["trust_token"]:
-            mod.module.no_log_values.add(params["trust_token"])
+        if params["link_token"]:
+            mod.module.no_log_values.add(params["link_token"])
+        elif params.get("trust_token"):
+            # Before 0.2.0 the token of the other cluster was the option trust_token. That name is the connection option now.
+            mod.warn(
+                "trust_token is the connection option that adds this client to the trust store. "
+                "The token of a pending link on the other cluster is the option link_token since version 0.2.0."
+            )
         public = params["type"] == "public"
-        if public and (params["trust_token"] or params["auth_groups"]):
-            mod.fail("trust_token and auth_groups are not for a public link")
+        if public and (params["link_token"] or params["auth_groups"]):
+            mod.fail("link_token and auth_groups are not for a public link")
         if not public and (params["remote_address"] or params["fingerprint"]):
             mod.fail("remote_address and fingerprint are only for a public link")
         for key in params["config"] or {}:
@@ -258,21 +266,21 @@ class ClusterLinkModule:
             self.mod.exit(True, before={}, after=after, link=link, pending=is_pending(link), **public_result)
         if params["auth_groups"] is not None:
             body["auth_groups"] = params["auth_groups"]
-        if params["trust_token"]:
-            body["trust_token"] = params["trust_token"]
+        if params["link_token"]:
+            body["trust_token"] = params["link_token"]
         elif self.pending_identity() is not None:
             # A pending unidirectional link has no link object on this cluster, only the pending identity.
             self.mod.exit(False, before={}, after={}, link=None, pending=True, msg=f"a token for link {self.name} is already open")
         if self.mod.check_mode:
-            self.mod.exit(True, before={}, after=after, link=predicted, pending=not params["trust_token"])
+            self.mod.exit(True, before={}, after=after, link=predicted, pending=not params["link_token"])
         meta = self.mod.client.write("POST", "/1.0/cluster/links", body=body)
         new_link, _etag = self.read()
         result: dict[str, t.Any] = {}
-        if not params["trust_token"]:
+        if not params["link_token"]:
             if not isinstance(meta, dict) or not meta.get("secret"):
                 self.mod.fail("LXD did not return a token for the pending link")
             token = encode_token(meta)
-            result["trust_token"] = token
+            result["link_token"] = token
         self.mod.exit(True, before={}, after=after, link=new_link, pending=new_link is None or is_pending(new_link), **result)
 
     def pending_identity(self) -> dict[str, t.Any] | None:
@@ -332,7 +340,7 @@ def get_argument_spec() -> ArgumentSpecMutT:
         "name": {"type": "str", "required": True},
         "state": {"type": "str", "default": "present", "choices": ["present", "absent"]},
         "type": {"type": "str", "default": "bidirectional", "choices": ["bidirectional", "unidirectional", "public"]},
-        "trust_token": {"type": "str", "no_log": True},
+        "link_token": {"type": "str", "no_log": True},
         "auth_groups": {"type": "list", "elements": "str"},
         "remote_address": {"type": "str"},
         "fingerprint": {"type": "str"},

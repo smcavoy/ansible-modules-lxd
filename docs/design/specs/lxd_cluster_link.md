@@ -26,7 +26,7 @@ Required API extensions: `cluster_links`. `unidirectional` needs `cluster_links_
 | `name` | str | | yes | The link name on this cluster. |
 | `state` | str | `present` | no | `present` or `absent`. |
 | `type` | str | `bidirectional` | no | Create-only. `bidirectional`, `unidirectional`, or `public`. |
-| `trust_token` | str | | no | Secret. Create-only. The token from the other cluster. |
+| `link_token` | str | | no | Secret. Create-only. The token from the other cluster. |
 | `auth_groups` | list | | no | Create-only. Groups for the identity of the other cluster. Not for `public`. |
 | `remote_address` | str | | no | Create-only, `public` only. The address of the other cluster. |
 | `fingerprint` | str | | no | Create-only, `public` only. The expected certificate fingerprint of the other cluster. |
@@ -46,8 +46,8 @@ A link needs two steps, one on each cluster.
 
 | Case | Action |
 |---|---|
-| Absent, no `trust_token` | `POST` with `name` and `type`. LXD makes a pending link and returns a token. The module returns it as `trust_token`. |
-| Absent, with `trust_token` | `POST` with `name`, `type`, `trust_token`, and `auth_groups`. LXD contacts the other cluster and activates both sides. |
+| Absent, no `link_token` | `POST` with `name` and `type`. LXD makes a pending link and returns a token. The module returns it as `link_token`. |
+| Absent, with `link_token` | `POST` with `name`, `type`, the token as the LXD field `trust_token`, and `auth_groups`. LXD contacts the other cluster and activates both sides. |
 | Present | Compare `description` and `config`. `PUT` if they differ. Create-only options follow rule R10. |
 
 Run the module without a token on cluster B. Then run it with the returned token on cluster A.
@@ -76,7 +76,7 @@ The diff holds `type`, `description`, and `config`. Check mode does not contact 
 | Key | Type | Rule |
 |---|---|---|
 | `link` | dict | The link from `GET`, after the change. `null` after a delete. |
-| `trust_token` | str | Only from a pending create. Secret. Rule R9. |
+| `link_token` | str | Only from a pending create. Secret. Rule R9. |
 | `remote_fingerprint` | str | Only from a pending `public` create. |
 
 ```yaml
@@ -87,7 +87,7 @@ link:
   config:
     volatile.addresses: 10.0.0.41:8443
   used_by: []
-trust_token: eyJjbGllbnRfbmFtZSI6...
+link_token: eyJjbGllbnRfbmFtZSI6...
 ```
 
 ## 9. Errors
@@ -95,7 +95,7 @@ trust_token: eyJjbGllbnRfbmFtZSI6...
 | Case | Message |
 |---|---|
 | A bad token. | The LXD error `Invalid trust token: ...` |
-| `trust_token` with `type: public`. | The LXD error `Trust token cannot be set for public cluster links` |
+| `link_token` with `type: public`. | The LXD error `Trust token cannot be set for public cluster links` |
 | `remote_address` without `type: public`. | The LXD error `Remote address can only be set for public cluster links` |
 | Delete a link in use. | The LXD error `Cluster link is currently in use` |
 | The public fingerprint differs. | `remote fingerprint <got> does not match <expected>` |
