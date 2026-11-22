@@ -1,0 +1,74 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+
+# The fast checks: lint, docs, licenses, build, sanity, and unit tests on every pull request and on main.
+# They need no LXD server. The integration suite needs one and does not run here.
+name: fast
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  fast:
+    # Each ansible-core version needs its own Python: 2.19 needs 3.11, 2.20 and 2.21 need 3.12, 2.22 needs 3.13.
+    # The lint, docs, license and build checks run once, on the newest Python.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.11"
+            cores: "2.19"
+            lint: "0"
+          - python: "3.12"
+            cores: "2.20 2.21"
+            lint: "0"
+          - python: "3.13"
+            cores: "2.22"
+            lint: "1"
+    name: fast (Python ${{ matrix.python }}, ansible-core ${{ matrix.cores }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the test tools
+        # nox and the build check use the newest ansible-core of this job. Sanity and units get their own venvs.
+        run: python3 -m pip install -q -r ci/requirements-fast.txt "ansible-core==${CORE##* }.*"
+        env:
+          CORE: ${{ matrix.cores }}
+      - name: Run the fast checks
+        run: ci/run-fast.sh
+        env:
+          CI_CORES: ${{ matrix.cores }}
+          SKIP_NOX: ${{ matrix.lint == '0' && '1' || '' }}
+          SKIP_TOOL_LINT: ${{ matrix.lint == '0' && '1' || '' }}
+
+  devel:
+    # Sanity and unit tests with the development branch of ansible-core. It shows changes that come with the next
+    # release. A failure here does not fail the workflow.
+    name: devel (ansible-core devel)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/smcavoy/lxd
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ansible-core devel
+        run: python3 -m pip install -q https://github.com/ansible/ansible/archive/devel.tar.gz
+      - name: Sanity tests
+        working-directory: ansible_collections/smcavoy/lxd
+        run: ansible-test sanity --venv --python 3.13 --color no
+      - name: Unit tests
+        working-directory: ansible_collections/smcavoy/lxd
+        run: ansible-test units --venv --python 3.13 --color no

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# First boot of a test sandbox VM. It sets up LXD and trusts the test client certificate.
+# It runs once. The marker file stops later runs.
+# The instance key user.sandbox.mode=cluster skips the preseed. A cluster fixture then forms the cluster.
+# The mode microcloud leaves LXD untouched and starts the MicroCeph, MicroOVN, and MicroCloud services.
+# The MicroCloud fixture then runs microcloud preseed and trusts the test client.
+set -eu
+
+MARKER=/var/lib/lxd-sandbox/done
+[ -e "$MARKER" ] && exit 0
+PATH=/snap/bin:$PATH
+
+mode=$(curl -sf --unix-socket /dev/lxd/sock http://lxd/1.0/config/user.sandbox.mode || true)
+lxd waitready --timeout=300
+if [ "$mode" = "microcloud" ]; then
+  # The daemons made their certificates during the image build, so every copy of the image has the same identity.
+  # MicroCloud then refuses the join with "Fingerprint already exists". A fresh state gives each member its own identity.
+  for snap in microceph microovn microcloud; do
+    rm -rf "/var/snap/$snap/common/state"
+    mkdir -p "/var/snap/$snap/common/state"
+  done
+  xargs -r snap start --enable </etc/lxd-sandbox/micro-services
+  mkdir -p /var/lib/lxd-sandbox
+  touch "$MARKER"
+  exit 0
+fi
+if [ "$mode" = "cluster" ]; then
+  lxc config set core.https_address "[::]:8443" </dev/null
+else
+  lxd init --preseed </etc/lxd-sandbox/preseed.yaml
+fi
+lxc config trust add /etc/lxd-sandbox/client.crt --name test-client </dev/null
+
+mkdir -p /var/lib/lxd-sandbox
+touch "$MARKER"

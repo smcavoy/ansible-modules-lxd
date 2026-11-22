@@ -1,0 +1,52 @@
+# Goal: SC-IDEMP runs the SC-WEB tasks twice, and every task of the second run reports no change.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-IDEMP second run of the web stack
+  hosts: localhost
+  gather_facts: false
+  vars:
+    web_project: "t-{{ lxd_run_id }}-idem"
+    web_bridge: "tb{{ lxd_run_id }}i"
+    web_subnet: "10.{{ 170 + (lxd_slot | int) }}.0"
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-IDEMP 1: first run"
+          ansible.builtin.include_tasks: ../SC-WEB/apply.yml
+
+        - name: "SC-IDEMP 2: second run with the same input"
+          ansible.builtin.include_tasks: ../SC-WEB/apply.yml
+
+        - name: "SC-IDEMP 3: no task of the second run reports a change"
+          ansible.builtin.assert:
+            that:
+              - web_results[1].values() | map('bool') | select | list | length == 0
+            fail_msg: "Second run changed: {{ web_results[1] | dict2items | selectattr('value', 'equalto', true) | map(attribute='key') | list }}"
+
+        - name: "SC-IDEMP 4: a check mode run predicts no change"
+          smcavoy.lxd.lxd_instance:
+            name: web1
+            project: "{{ web_project }}"
+            profiles:
+              - web
+            state: started
+          check_mode: true
+          register: idem_check_mode
+
+        - name: "SC-IDEMP 5: check mode agrees"
+          ansible.builtin.assert:
+            that:
+              - idem_check_mode is not changed
+            fail_msg: "Check mode predicted a change: {{ idem_check_mode.diff | default('no diff') }}"
+      always:
+        - name: Remove all scenario resources
+          ansible.builtin.include_tasks: ../SC-WEB/cleanup.yml

@@ -1,0 +1,267 @@
+# Goal: lxd_profile creates, updates, and deletes profiles idempotently, with check and diff mode.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_profile tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    prof: "t-{{ lxd_run_id }}-prof"
+    prof_url: "{{ lxd_url }}/1.0/profiles/{{ prof }}"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: 1
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+        status_code: [200, 404]
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create the profile"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        description: test profile
+        config:
+          limits.cpu: 1
+        devices:
+          tmp:
+            type: disk
+            source: /tmp
+            path: /mnt/tmp
+      register: c2_result
+
+    - name: "C2: the module creates the profile"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.profile.config['limits.cpu'] == '1'
+          - c2_result.profile.devices.tmp.path == '/mnt/tmp'
+          - c2_result.profile.description == 'test profile'
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        description: test profile
+        config:
+          limits.cpu: 1
+        devices:
+          tmp:
+            type: disk
+            source: /tmp
+            path: /mnt/tmp
+      register: c3_result
+
+    - name: "C3: a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: 2
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows only the option, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.config['limits.cpu'] == '1'
+          - c4_result.diff.after.config['limits.cpu'] == '2'
+          - c4_server.json.metadata.config['limits.cpu'] == '1'
+
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: 2
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c5_server
+
+    - name: "C5: the module updates the option"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config['limits.cpu'] == '2'
+          - c5_server.json.metadata.devices.tmp is defined
+
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+        method: PATCH
+        body:
+          config:
+            user.other: set-by-api
+
+    - name: "C6: run without the key in merge mode"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: 2
+      register: c6_result
+
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c6_server
+
+    - name: "C6: merge keeps keys that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: 2
+        config_mode: exact
+      register: c7_result
+
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c7_server
+
+    - name: "C7: exact removes unmanaged keys"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        config:
+          limits.cpu: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c8_server
+
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'limits.cpu' not in c8_server.json.metadata.config"
+
+    - name: "C9: a device without a type"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        devices:
+          broken:
+            path: /x
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'needs a type' in c9_result.msg"
+
+    - name: "PR1: devices_mode exact removes an unmanaged device"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        devices: {}
+        devices_mode: exact
+      register: pr1_result
+
+    - name: "PR1: the device is gone"
+      ansible.builtin.assert:
+        that:
+          - pr1_result is changed
+          - pr1_result.profile.devices == {}
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+      register: c10_server
+
+    - name: "C10: the profile still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the profile"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ prof_url }}"
+        status_code: [200, 404]
+      register: c11_server
+
+    - name: "C11: the module deletes the profile"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.profile is none
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test profile
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        state: absent
+      failed_when: false

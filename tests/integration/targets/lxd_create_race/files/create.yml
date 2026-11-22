@@ -1,0 +1,24 @@
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# One writer of the race. The target starts several of these at the same moment.
+- name: One writer
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Create the project
+      smcavoy.lxd.lxd_project:
+        name: "{{ name }}"
+        description: race
+    - name: Create the profile
+      smcavoy.lxd.lxd_profile:
+        name: "{{ name }}"
+        description: race

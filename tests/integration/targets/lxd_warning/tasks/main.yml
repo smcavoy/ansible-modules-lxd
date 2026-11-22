@@ -1,0 +1,190 @@
+# Goal: lxd_warning_info lists and filters warnings, and lxd_warning acknowledges, resets, and deletes a warning when the server has one.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_warning and lxd_warning_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+  vars:
+    net: "t{{ lxd_run_id }}wn"
+    # LXD makes this warning when a bridge has raw.dnsmasq. Run 909 showed that a clean sandbox has no warning.
+    warning_type: Skipping AppArmor for dnsmasq due to raw.dnsmasq being set
+  block:
+    - name: Make a warning with a bridge that has raw.dnsmasq
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv6.address: none
+          raw.dnsmasq: "# lxd_warning test"
+
+    - name: "I1: list all warnings"
+      smcavoy.lxd.lxd_warning_info:
+      register: i1_result
+
+    - name: "I3: a missing UUID"
+      smcavoy.lxd.lxd_warning_info:
+        uuid: 00000000-0000-0000-0000-000000000000
+      register: i3_result
+
+    - name: "I4: the warnings of the project default in check mode"
+      smcavoy.lxd.lxd_warning_info:
+        project: default
+        severity: [low, moderate, high]
+      check_mode: true
+      register: i4_result
+
+    - name: "W0: a missing warning"
+      smcavoy.lxd.lxd_warning:
+        uuid: 00000000-0000-0000-0000-000000000000
+        status: acknowledged
+      register: w0_result
+      ignore_errors: true
+
+    - name: "I1: log the warnings"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT warnings {{ i1_result.lxd_warnings | to_json }}"
+
+    - name: "I1, I3, I4 and W0: the reads work, and a missing warning fails"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - i3_result.lxd_warnings == []
+          - i4_result is not changed
+          - i4_result.lxd_warnings | length <= i1_result.lxd_warnings | length
+          - w0_result is failed
+          - w0_result.msg == 'warning 00000000-0000-0000-0000-000000000000 not found'
+
+    - name: "W0: find the warning of the bridge"
+      ansible.builtin.set_fact:
+        made: "{{ i1_result.lxd_warnings | selectattr('type', 'eq', warning_type) | list }}"
+
+    - name: "W0: the bridge made a warning"
+      ansible.builtin.assert:
+        that:
+          - made | length > 0
+        fail_msg: "LXD made no warning of the type {{ warning_type }}. The target needs one for W1 to W4."
+
+    - name: Run W1 to W4 on the warning of the bridge
+      vars:
+        uuid: "{{ made[0].uuid }}"
+        warning_url: "{{ lxd_url }}/1.0/warnings/{{ made[0].uuid }}"
+      block:
+        - name: "I2: read the warning by UUID"
+          smcavoy.lxd.lxd_warning_info:
+            uuid: "{{ uuid }}"
+          register: i2_result
+
+        - name: "W1: acknowledge the warning"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            status: acknowledged
+          register: w1_result
+
+        - name: "W1: read the warning from the server"
+          ansible.builtin.uri:
+            url: "{{ warning_url }}"
+            status_code: 200
+          register: w1_server
+          retries: 3
+          delay: 2
+          until: w1_server is not failed
+
+        - name: "W2: run W1 again"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            status: acknowledged
+          register: w2_result
+
+        - name: "W1: the status filter finds it"
+          smcavoy.lxd.lxd_warning_info:
+            status: [acknowledged]
+          register: w1_info
+
+        - name: "W3: set the status back to new"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            status: new
+          register: w3_result
+
+        - name: "W3: read the warning from the server"
+          ansible.builtin.uri:
+            url: "{{ warning_url }}"
+            status_code: 200
+          register: w3_server
+          retries: 3
+          delay: 2
+          until: w3_server is not failed
+
+        - name: "W4: check mode predicts a delete"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            state: absent
+          check_mode: true
+          register: w4_check
+
+        - name: "W4: the server still has the warning after check mode"
+          ansible.builtin.uri:
+            url: "{{ warning_url }}"
+            status_code: 200
+          register: w4_check_server
+          retries: 3
+          delay: 2
+          until: w4_check_server is not failed
+
+        - name: "W4: delete the warning"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            state: absent
+          register: w4_result
+
+        - name: "W4: the server has no warning after the delete"
+          ansible.builtin.uri:
+            url: "{{ warning_url }}"
+            status_code: 404
+          register: w4_server
+          retries: 3
+          delay: 2
+          until: w4_server is not failed
+
+        - name: "W4: delete it again"
+          smcavoy.lxd.lxd_warning:
+            uuid: "{{ uuid }}"
+            state: absent
+          register: w4_again
+
+        - name: "I2 and W1 to W4: acknowledge, no change on a second run, reset, and delete"
+          ansible.builtin.assert:
+            that:
+              - i2_result.lxd_warnings | length == 1
+              - w1_result is changed
+              - w1_result.warning.status == 'acknowledged'
+              - w2_result is not changed
+              - uuid in (w1_info.lxd_warnings | map(attribute='uuid') | list)
+              - w3_result is changed
+              - w3_result.warning.status == 'new'
+              - w4_check is changed
+              - w4_result is changed
+              - w4_result.warning is none
+              - w4_again is not changed
+              - w1_server.json.metadata.uuid == uuid
+              - w1_server.json.metadata.type == warning_type
+              - w1_server.json.metadata.status == 'acknowledged'
+              - w3_server.json.metadata.status == 'new'
+              - w4_check_server.json.metadata.status == 'new'
+  always:
+    - name: Remove the bridge
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: absent
+      failed_when: false

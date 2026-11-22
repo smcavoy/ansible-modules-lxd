@@ -1,0 +1,68 @@
+# Goal: lxd_project_info lists projects, reads one, gives an empty list for a missing name, and adds usage.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_project_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: Create a test project
+      smcavoy.lxd.lxd_project:
+        name: "{{ run }}-proj"
+
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_project_info:
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_project_info:
+        name: "{{ run }}-proj"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_project_info:
+        name: no-such-project
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_project_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: the list holds the test object, one by name works, a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - (run ~ "-proj") in (i1_result.projects | map(attribute='name') | list)
+          - i2_result.projects | length == 1
+          - i2_result.projects[0].name == (run ~ "-proj")
+          - i3_result is not changed
+          - i3_result.projects == []
+          - i4_result is not changed
+          - i4_result.projects | length == i1_result.projects | length
+
+    - name: "PI1: read the project with its usage"
+      smcavoy.lxd.lxd_project_info:
+        name: "{{ run }}-proj"
+        include_state: true
+      register: pi1_result
+
+    # LXD returns the fields Limit and Usage with capital letters.
+    - name: "PI1: include_state adds the usage"
+      ansible.builtin.assert:
+        that:
+          - pi1_result.projects[0].state.resources.instances.Usage is number
+  always:
+    - name: Remove the test project
+      smcavoy.lxd.lxd_project:
+        name: "{{ run }}-proj"
+        state: absent
+      failed_when: false

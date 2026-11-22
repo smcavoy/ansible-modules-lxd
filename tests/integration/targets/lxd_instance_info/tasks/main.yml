@@ -1,0 +1,98 @@
+# Goal: lxd_instance_info lists instances, reads one with its state, filters by status, and leaves out the state on request.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: Start a test container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ run }}-ct"
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_instance_info:
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_instance_info:
+        name: "{{ run }}-ct"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_instance_info:
+        name: no-such-instance
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_instance_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: the list holds the test object, one by name works, a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - (run ~ "-ct") in (i1_result.instances | map(attribute='name') | list)
+          - i2_result.instances | length == 1
+          - i2_result.instances[0].name == (run ~ "-ct")
+          - i3_result is not changed
+          - i3_result.instances == []
+          - i4_result is not changed
+          - i4_result.instances | length == i1_result.instances | length
+
+    - name: "IN1: filter by status"
+      smcavoy.lxd.lxd_instance_info:
+        filter: status eq Running
+      register: in1_result
+
+    - name: "IN2: read without the state"
+      smcavoy.lxd.lxd_instance_info:
+        name: "{{ run }}-ct"
+        include_state: false
+      register: in2_result
+
+    - name: "IN1 and IN2: the filter finds the container, the state is there by default, and include_state false leaves it out"
+      ansible.builtin.assert:
+        that:
+          - i2_result.instances[0].state.status == 'Running'
+          - (run ~ '-ct') in (in1_result.instances | map(attribute='name') | list)
+          - "'state' not in in2_result.instances[0]"
+
+    - name: "IN3: one by name in all projects"
+      smcavoy.lxd.lxd_instance_info:
+        name: "{{ run }}-ct"
+        all_projects: true
+      register: in3_result
+
+    - name: "IN3: a missing name in all projects"
+      smcavoy.lxd.lxd_instance_info:
+        name: no-such-instance
+        all_projects: true
+      register: in3_missing
+
+    - name: "IN3: name with all_projects finds the container with its project and state, and a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - in3_result.instances | length >= 1
+          - in3_result.instances | map(attribute='name') | unique | list == [run ~ '-ct']
+          - "'default' in (in3_result.instances | map(attribute='project') | list)"
+          - in3_result.instances[0].state.status == 'Running'
+          - in3_missing.instances == []
+  always:
+    - name: Remove the test container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ run }}-ct"
+        state: absent
+        force: true
+      failed_when: false

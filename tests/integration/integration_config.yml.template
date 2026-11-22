@@ -1,0 +1,51 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+
+# The variables that the integration targets and the scenarios read.
+# tests/lxd/lxdtest writes them for each slot (Slot.prepare) into tests/integration/integration_config.yml.
+# To run a target by hand against your own test LXD server: copy this file to integration_config.yml in this
+# folder, set the values, and run "ansible-test integration --allow-unsupported --local <target>".
+# The copy is not in git. Every value below is a placeholder. Use a test server only: the targets create and
+# delete objects.
+
+# The URL of the LXD API. The host name must be a name in the server certificate.
+lxd_url: https://lxd.example.org:8443
+# The file with the client certificate that the server trusts (PEM).
+lxd_client_cert: /path/to/client.crt
+# The file with the key of the client certificate (PEM).
+lxd_client_key: /path/to/client.key
+# The file with the certificate of the server (PEM). The modules and the uri tasks check the server with it.
+lxd_server_cert: /path/to/server.crt
+# A short id that is part of every object name of the tests (t-<id>-...), so that two runs do not collide.
+lxd_run_id: ab12
+# The number of the runner slot. Some tests make their test subnets from it. Use 1.
+lxd_slot: 1
+# The IP address of the LXD server.
+lxd_sandbox_ip: 192.0.2.10
+# The name of the LXD server; in the runner, the name of the sandbox VM on the host LXD.
+lxd_sandbox_name: sbx-ab12-1
+# The fixture that the server is: standalone, cluster, cluster-new, multicluster or microcloud.
+lxd_fixture: standalone
+# The lxc remote of the host LXD that holds the sandbox VM. Only lxd_fault_server uses it, to act inside the VM.
+lxd_host_remote: host
+# The project of the sandbox VM on the host LXD. Only lxd_fault_server uses it.
+lxd_host_project: my-test-project
+# The alias of a small container image that the server already has.
+lxd_image_ct: test/alpine-ct
+# The metadata file of that container image, in the split format, for the upload tests of lxd_image.
+lxd_image_ct_meta: /path/to/images/alpine-ct.meta
+# The root file system file of that container image.
+lxd_image_ct_rootfs: /path/to/images/alpine-ct.root
+# The metadata file of a small virtual machine image, in the split format.
+lxd_image_vm_meta: /path/to/images/alpine-vm.meta
+# The root disk file of that virtual machine image.
+lxd_image_vm_rootfs: /path/to/images/alpine-vm.root
+# The storage pool for the instances and volumes of the tests. Empty on the cluster fixtures.
+lxd_pool: default
+# The names of the cluster members. Empty on a standalone server.
+lxd_members: []
+
+# The other fixtures add variables, for example lxd_cluster_pool_dirs, lxd_member_urls, lxd_peer_url and
+# lxd_ovn_uplink. See the prepare method of each slot class in tests/lxd/lxdtest.

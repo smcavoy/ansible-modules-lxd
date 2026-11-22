@@ -1,0 +1,265 @@
+# Goal: lxd_storage_volume creates, updates, copies, and deletes custom volumes idempotently, with check and diff mode.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_volume tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    vol: "t-{{ lxd_run_id }}-vol"
+    vol_url: "{{ lxd_url }}/1.0/storage-pools/{{ lxd_pool }}/volumes/custom/t-{{ lxd_run_id }}-vol"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "first"
+        config:
+          user.purpose: "test"
+      check_mode: true
+      register: c1_result
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c1_server
+    - name: "C1: nothing exists yet"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+    - name: "C2: create"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "first"
+        config:
+          user.purpose: "test"
+      register: c2_result
+    - name: "C2: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c2_server
+    - name: "C2: the module creates it"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_server.status == 200
+          - c2_server.json.metadata.content_type == 'filesystem'
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "first"
+        config:
+          user.purpose: "test"
+      register: c3_result
+    - name: "C3: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "second"
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c4_server
+    - name: "C4: change predicted, server unchanged"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before != c4_result.diff.after
+          - c4_server.json.metadata.description == 'first'
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "second"
+      register: c5_result
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c5_server
+    - name: "C5: the server has the new value"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.description == 'second'
+    # LXD 6.10.1 resets the description on a PATCH without it, so the PATCH sends it again.
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+        method: PATCH
+        body:
+          description: "second"
+          config:
+            user.other: "set-by-api"
+    - name: "C6: run without the key"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "second"
+      register: c6_result
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c6_server
+    - name: "C6: merge keeps the key"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+    - name: "C7: config_mode exact"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: "second"
+        config:
+          user.purpose: "test"
+        config_mode: "exact"
+      register: c7_result
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c7_server
+    - name: "C7: exact removes the unmanaged key"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+    - name: "C8: set a key"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        config:
+          user.temp: "1"
+      register: c8a_result
+    - name: "C8: remove it with null"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        config:
+          user.temp: null
+      register: c8_result
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c8_server
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'user.temp' not in c8_server.json.metadata.config"
+    - name: "C9: bad input"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        content_type: "bogus"
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - '"must be one of" in c9_result.msg'
+    - name: "V2: copy the volume"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}-copy"
+        source:
+          volume: "{{ vol }}"
+      register: v2_result
+    - name: "V2: the copy exists"
+      ansible.builtin.assert:
+        that:
+          - v2_result is changed
+          - v2_result.storage_volume.name == vol ~ '-copy'
+    - name: "V2: copy again"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}-copy"
+        source:
+          volume: "{{ vol }}"
+      register: v2b_result
+    - name: "V2: a second copy run warns and makes no change"
+      ansible.builtin.assert:
+        that:
+          - v2b_result is not changed
+          - v2b_result.warnings | select('search', 'source applies only on create') | list | length == 1
+    - name: "V2: remove the copy"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}-copy"
+        state: "absent"
+      register: v2c_result
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        state: "absent"
+      check_mode: true
+      register: c10_result
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c10_server
+    - name: "C10: it still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+    - name: "C11: delete"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        state: "absent"
+      register: c11_result
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ vol_url }}"
+      register: c11_server
+    - name: "C11: it is gone"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_server.status == 404
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        state: "absent"
+      register: c12_result
+    - name: "C12: no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test object
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        state: "absent"
+      failed_when: false
+    - name: Remove the copy
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}-copy"
+        state: absent
+      failed_when: false

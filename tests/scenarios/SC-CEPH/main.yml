@@ -1,0 +1,212 @@
+# Goal: SC-CEPH puts a container and a volume on a new Ceph pool, moves the container to another member with its data, and makes an S3 bucket with a key.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-CEPH pool, volume, move and bucket
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ceph_pool: "t{{ lxd_run_id }}cp"
+    object_pool: "t{{ lxd_run_id }}co"
+    volume: "t-{{ lxd_run_id }}-cvol"
+    ct: "t-{{ lxd_run_id }}-cct"
+    bucket: "t{{ lxd_run_id }}-scceph"
+    home: "{{ lxd_members[1] }}"
+    ct_devices:
+      root:
+        type: disk
+        path: /
+        pool: "{{ ceph_pool }}"
+      data:
+        type: disk
+        pool: "{{ ceph_pool }}"
+        source: "{{ volume }}"
+        path: /data
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-CEPH 1: create a Ceph pool on all members"
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ ceph_pool }}"
+            driver: ceph
+            description: SC-CEPH
+          register: sc_pool
+
+        - name: "SC-CEPH 2: create a volume on the pool"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ ceph_pool }}"
+            name: "{{ volume }}"
+            description: SC-CEPH data
+
+        - name: "SC-CEPH 3: start a container on member 2, with its root and the volume on the pool"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ ct }}"
+            target: "{{ home }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices: "{{ ct_devices }}"
+            wait_for:
+              - type: ipv4
+            wait_timeout: 240
+          register: sc_ct
+
+        - name: "SC-CEPH 4: write a marker on the root disk and on the volume"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ ct }}"
+            command: [sh, -c, "echo root {{ lxd_run_id }} > /root/marker && echo data {{ lxd_run_id }} > /data/marker && sync"]
+
+        - name: "SC-CEPH 5: evacuate member 2, and move its instances"
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ home }}"
+            state: evacuated
+            evacuate_mode: migrate
+          register: sc_evacuate
+
+        - name: "SC-CEPH 6: read the container after the move"
+          smcavoy.lxd.lxd_instance_info:
+            name: "{{ ct }}"
+          register: sc_moved
+
+        - name: "SC-CEPH 7: read the markers on the new member"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ ct }}"
+            command: [cat, /root/marker, /data/marker]
+          register: sc_markers
+
+        - name: "SC-CEPH 8: restore member 2"
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ home }}"
+            state: present
+          register: sc_restore
+
+        - name: "SC-CEPH 9: read the container after the restore"
+          smcavoy.lxd.lxd_instance_info:
+            name: "{{ ct }}"
+          register: sc_back
+
+        - name: "SC-CEPH 10: create a cephobject pool on the RADOS gateway"
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ object_pool }}"
+            driver: cephobject
+            config:
+              cephobject.radosgw.endpoint: "{{ lxd_rgw_endpoint }}"
+
+        - name: "SC-CEPH 11: create a bucket"
+          smcavoy.lxd.lxd_storage_bucket:
+            pool: "{{ object_pool }}"
+            name: "{{ bucket }}"
+            config:
+              size: 1GiB
+          register: sc_bucket
+          no_log: true
+
+        - name: "SC-CEPH 12: create a read-only key for the bucket"
+          smcavoy.lxd.lxd_storage_bucket_key:
+            pool: "{{ object_pool }}"
+            bucket: "{{ bucket }}"
+            name: reader
+          register: sc_key
+          no_log: true
+
+        - name: "SC-CEPH 13: ask the RADOS gateway for the bucket without a key"
+          ansible.builtin.uri:
+            url: "{{ sc_bucket.bucket.s3_url }}"
+            status_code: [200, 403, 404]
+          register: sc_s3
+
+        - name: "SC-CEPH 14: log the facts"
+          ansible.builtin.debug:
+            msg: >-
+              LXDTEST-FACT sc-ceph home={{ home }} moved={{ sc_moved.instances[0].location }}
+              back={{ sc_back.instances[0].location }} s3={{ sc_s3.status }} s3_url={{ sc_bucket.bucket.s3_url }}
+
+        - name: "SC-CEPH 15: run the pool, volume and container steps again"
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ ceph_pool }}"
+            driver: ceph
+            description: SC-CEPH
+          register: sc_pool_again
+
+        - name: "SC-CEPH 16: run the volume step again"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ ceph_pool }}"
+            name: "{{ volume }}"
+            description: SC-CEPH data
+          register: sc_volume_again
+
+        - name: "SC-CEPH 17: run the container step again"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ ct }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices: "{{ ct_devices }}"
+          register: sc_ct_again
+
+        - name: "SC-CEPH 18: run the bucket and key steps again"
+          smcavoy.lxd.lxd_storage_bucket_key:
+            pool: "{{ object_pool }}"
+            bucket: "{{ bucket }}"
+            name: reader
+          register: sc_key_again
+
+        - name: "SC-CEPH 19: the container moved with its data and came back, the bucket exists in S3, and a second run makes no change"
+          ansible.builtin.assert:
+            that:
+              - sc_pool is changed
+              - sc_ct.instance.location == home
+              - sc_evacuate is changed
+              - sc_moved.instances[0].location != home
+              - sc_moved.instances[0].state.status == 'Running'
+              - sc_markers.stdout_lines == ['root ' ~ lxd_run_id, 'data ' ~ lxd_run_id]
+              - sc_restore is changed
+              - sc_back.instances[0].location == home
+              - sc_back.instances[0].state.status == 'Running'
+              - sc_bucket.admin_credentials.access_key | length > 0
+              - sc_key.key.role == 'read-only'
+              - sc_s3.status == 403
+              - sc_pool_again is not changed
+              - sc_volume_again is not changed
+              - sc_ct_again is not changed
+              - sc_key_again is not changed
+      always:
+        - name: Restore member 2
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ home }}"
+            state: present
+          failed_when: false
+
+        - name: Remove the container
+          smcavoy.lxd.lxd_instance:
+            name: "{{ ct }}"
+            state: absent
+            force: true
+          failed_when: false
+
+        - name: Remove the volume
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ ceph_pool }}"
+            name: "{{ volume }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the bucket
+          smcavoy.lxd.lxd_storage_bucket:
+            pool: "{{ object_pool }}"
+            name: "{{ bucket }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the pools
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ item }}"
+            state: absent
+          loop: ["{{ object_pool }}", "{{ ceph_pool }}"]
+          failed_when: false

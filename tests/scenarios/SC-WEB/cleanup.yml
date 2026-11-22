@@ -1,0 +1,33 @@
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Delete in reverse order of creation. A failure here must not hide the real failure.
+- name: Remove the forward
+  smcavoy.lxd.lxd_network_forward:
+    network: "{{ web_bridge }}"
+    listen_address: "{{ lxd_sandbox_ip }}"
+    state: absent
+  failed_when: false
+
+- name: Remove the container
+  smcavoy.lxd.lxd_instance:
+    name: web1
+    project: "{{ web_project }}"
+    state: absent
+    force: true
+  failed_when: false
+
+- name: Remove the project and its contents
+  smcavoy.lxd.lxd_project:
+    name: "{{ web_project }}"
+    state: absent
+    force_delete: true
+  failed_when: false
+
+- name: Remove the bridge
+  smcavoy.lxd.lxd_network:
+    name: "{{ web_bridge }}"
+    state: absent
+  failed_when: false

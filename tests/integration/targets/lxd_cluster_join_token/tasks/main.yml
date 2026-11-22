@@ -1,0 +1,81 @@
+# Goal: lxd_cluster_join_token issues one token per name, revokes it, and skips existing members.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_join_token tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    newname: "t{{ lxd_run_id }}new"
+  block:
+    - name: "JT0: check mode predicts a token"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ newname }}"
+      check_mode: true
+      register: jt0_result
+
+    - name: "JT1: issue a token"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ newname }}"
+      register: jt1_result
+      no_log: true
+
+    - name: "JT2: run again"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ newname }}"
+      register: jt2_result
+
+    - name: "JT1 and JT2: the token names the new member, and a second run issues none"
+      ansible.builtin.assert:
+        that:
+          - jt0_result is changed
+          - jt0_result.token is not defined
+          - jt1_result is changed
+          - (jt1_result.token | b64decode | from_json).server_name == newname
+          - (jt1_result.token | b64decode | from_json).secret | length > 0
+          - jt1_result.operation | length > 0
+          - jt2_result is not changed
+          - jt2_result.token is not defined
+
+    - name: "JT3: revoke the token"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ newname }}"
+        state: absent
+      register: jt3_result
+
+    - name: "JT3: read the operation of the token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/operations/{{ jt1_result.operation }}"
+      register: jt3_server
+
+    - name: "JT4: a token for an existing member"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ lxd_members[1] }}"
+      register: jt4_result
+
+    - name: "JT3 and JT4: the revoke ends the operation, and an existing member gets no token"
+      ansible.builtin.assert:
+        that:
+          - jt3_result is changed
+          - jt1_result.operation in jt3_result.revoked
+          - jt3_server.status == 404 or jt3_server.json.metadata.status != 'Running'
+          - jt4_result is not changed
+          - jt4_result.token is not defined
+  always:
+    - name: Revoke the test token
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ newname }}"
+        state: absent
+      failed_when: false

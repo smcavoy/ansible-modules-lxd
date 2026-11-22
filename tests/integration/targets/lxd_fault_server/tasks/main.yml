@@ -1,0 +1,266 @@
+# Goal: the modules give the true cause and converge after faults on the server: an LXD restart during a command, LXD stopped, a full pool.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# The target runs commands in the sandbox VM through its host LXD (lxd_host_remote, lxd_host_project).
+# lxd_host_env can set LXD_CONF for an lxc client that is not the default one.
+- name: Run the server fault tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  environment: "{{ lxd_host_env | default({}) }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-srv"
+    full: "t-{{ lxd_run_id }}-full"
+    full2: "t-{{ lxd_run_id }}-full2"
+    small: "t-{{ lxd_run_id }}-small"
+    in_vm: [lxc, exec, "{{ lxd_host_remote }}:{{ lxd_sandbox_name }}", --project, "{{ lxd_host_project }}", --]
+  block:
+    - name: The controller can run a command in the sandbox VM
+      ansible.builtin.command:
+        argv: "{{ in_vm + ['snap', 'list', 'lxd'] }}"
+      changed_when: false
+
+    - name: Start a container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        state: started
+
+    # FS1: LXD restarts during a command. LXD loses the operation, and the command runs on in the container.
+    # The restart starts from a background shell on the controller, 8 s from now; the command runs in the foreground.
+    - name: "FS1: restart LXD in 8 s (systemctl reload keeps the instances running)"
+      ansible.builtin.shell: >-
+        (sleep 8; {{ in_vm | map('quote') | join(' ') }} systemctl reload snap.lxd.daemon) >/dev/null 2>&1 &
+      changed_when: true
+    - name: "FS1: a 25 s command that leaves a mark at its end"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "sleep 25; touch /root/fs1-done"]
+        timeout: 120
+      register: fs1_result
+      ignore_errors: true
+    - name: "FS1: the command ends in the container after the restart"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [test, -f, /root/fs1-done]
+        ok_rc: [0, 1]
+      register: fs1_mark
+      until: fs1_mark.rc | default(1) == 0
+      retries: 20
+      delay: 3
+    - name: "FS1: the task fails fast, says that the command can still run, and does not say to run it again"
+      ansible.builtin.assert:
+        that:
+          - fs1_result is failed
+          - fs1_result is changed
+          - "'does not know operation' in fs1_result.msg"
+          - "'The command can still run in the instance' in fs1_result.msg"
+          - "'Run the task again' not in fs1_result.msg"
+          - fs1_mark.rc == 0
+
+    # FS2: LXD is stopped (the socket too, so that nothing starts it again).
+    - name: "FS2: stop LXD"
+      ansible.builtin.command:
+        argv: "{{ in_vm + ['systemctl', 'stop', 'snap.lxd.daemon.unix.socket', 'snap.lxd.daemon'] }}"
+      changed_when: true
+    - name: "FS2: a task while LXD is stopped"
+      smcavoy.lxd.lxd_project:
+        name: "t-{{ lxd_run_id }}-fs2"
+      register: fs2_down
+      ignore_errors: true
+    - name: "FS2: start LXD"
+      ansible.builtin.command:
+        argv: "{{ in_vm + ['systemctl', 'start', 'snap.lxd.daemon.unix.socket', 'snap.lxd.daemon'] }}"
+      changed_when: true
+    - name: "FS2: the same task when LXD is back"
+      smcavoy.lxd.lxd_project:
+        name: "t-{{ lxd_run_id }}-fs2"
+      register: fs2_up
+      until: fs2_up is not failed
+      retries: 10
+      delay: 3
+    - name: "FS2: the first task fails with the cause, and the second one creates the project"
+      ansible.builtin.assert:
+        that:
+          - fs2_down is failed
+          - "'Cannot reach LXD' in fs2_down.msg"
+          - fs2_up is changed
+
+    # FS3: a full storage pool. A 300 MiB btrfs pool, a container on it, and a file that fills it.
+    - name: "FS3: a small pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ small }}"
+        driver: btrfs
+        config:
+          size: 300MiB
+    - name: "FS3: a container on the small pool"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ full }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          root:
+            type: disk
+            path: /
+            pool: "{{ small }}"
+        state: started
+    - name: "FP4: a file with content before the pool is full"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ full }}"
+        path: /etc/fp4.conf
+        content: "old content\n"
+    - name: "FS3: fill the pool"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ full }}"
+        command: [sh, -c, "dd if=/dev/zero of=/fill bs=1M; sync"]
+        ok_rc: [0, 1]
+    - name: "FP1: put a 1 MiB file into the full container"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ full }}"
+        path: /etc/fp1.conf
+        content: "{{ 'x' * 1048576 }}"
+      register: fp1_full
+      ignore_errors: true
+    - name: "FP1: the new file is not there"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ full }}"
+        path: /etc/fp1.conf
+        state: absent
+      check_mode: true
+      register: fp1_left
+    - name: "FP4: overwrite the file with 1 MiB on the full pool"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ full }}"
+        path: /etc/fp4.conf
+        content: "{{ 'y' * 1048576 }}"
+      register: fp4_full
+      ignore_errors: true
+    - name: "FP2: make a container on the full pool"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ full2 }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          root:
+            type: disk
+            path: /
+            pool: "{{ small }}"
+      register: fp2_full
+      ignore_errors: true
+    - name: "FP2: LXD removes the container that it could not make"
+      smcavoy.lxd.lxd_instance_info:
+        name: "{{ full2 }}"
+      register: fp2_info
+    - name: "FP3: snapshot the container on the full pool"
+      smcavoy.lxd.lxd_instance_snapshot:
+        instance: "{{ full }}"
+        name: s1
+      register: fp3_full
+      ignore_errors: true
+    - name: "FP3: LXD removes the snapshot that it could not finish"
+      smcavoy.lxd.lxd_instance_snapshot:
+        instance: "{{ full }}"
+        name: s1
+        state: absent
+      check_mode: true
+      register: fp3_gone
+    - name: "FP1 to FP3: each write fails with the true cause, and leaves no half object"
+      ansible.builtin.assert:
+        that:
+          - fp1_full is failed
+          - "'no space left on device' in fp1_full.msg"
+          - "'broke' not in fp1_full.msg"
+          - "'deleted the /etc/fp1.conf that LXD left' in fp1_full.msg"
+          - fp1_left is not changed
+          - fp4_full is failed
+          # On a full btrfs pool LXD answers the write-back with success and stores nothing, so the old content stays lost.
+          - "'could not write the old content back' in fp4_full.msg"
+          - fp2_full is failed
+          - "'no space left on device' in fp2_full.msg"
+          - fp2_info.instances | length == 0
+          - fp3_full is failed
+          - "'no space left on device' in fp3_full.msg"
+          - fp3_gone is not changed
+
+    # Exec cannot free the pool: LXD cannot record the output of a command on the full disk.
+    # The admin grows the pool instead.
+    - name: "FS3: grow the pool to 600 MiB"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ small }}"
+        driver: btrfs
+        config:
+          size: 600MiB
+      register: fs3_grow
+    - name: "FP1 to FP3: run the three writes again"
+      block:
+        - name: "FP1: the file"
+          smcavoy.lxd.lxd_instance_file:
+            instance: "{{ full }}"
+            path: /etc/fp1.conf
+            content: "{{ 'x' * 1048576 }}"
+          register: fp1_again
+          until: fp1_again is not failed
+          retries: 6
+          delay: 5
+        - name: "FP2: the container"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ full2 }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices:
+              root:
+                type: disk
+                path: /
+                pool: "{{ small }}"
+          register: fp2_again
+        - name: "FP4: the old content again"
+          smcavoy.lxd.lxd_instance_file:
+            instance: "{{ full }}"
+            path: /etc/fp4.conf
+            content: "old content\n"
+          register: fp4_again
+        - name: "FP3: the snapshot"
+          smcavoy.lxd.lxd_instance_snapshot:
+            instance: "{{ full }}"
+            name: s1
+          register: fp3_again
+    - name: "FP1 to FP3: with space, the writes converge"
+      ansible.builtin.assert:
+        that:
+          - fp1_again is changed
+          - fp4_again is changed
+          - fp4_again.file.sha256 == 'old content\n' | hash('sha256')
+          - fp1_again.file.sha256 == ('x' * 1048576) | hash('sha256')
+          - fp2_again is changed
+          - fp3_again is changed
+          - fs3_grow is changed
+  always:
+    - name: Start LXD if a test stopped it
+      ansible.builtin.command:
+        argv: "{{ in_vm + ['systemctl', 'start', 'snap.lxd.daemon.unix.socket', 'snap.lxd.daemon'] }}"
+      changed_when: false
+      failed_when: false
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: ["{{ ct }}", "{{ full }}", "{{ full2 }}"]
+      failed_when: false
+    - name: Remove the project
+      smcavoy.lxd.lxd_project:
+        name: "t-{{ lxd_run_id }}-fs2"
+        state: absent
+      failed_when: false
+    - name: Remove the small pool
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ small }}"
+        state: absent
+      failed_when: false

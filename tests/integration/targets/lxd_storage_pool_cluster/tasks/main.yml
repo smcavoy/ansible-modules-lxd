@@ -1,0 +1,162 @@
+# Goal: lxd_storage_pool creates a pool on a cluster with a source per member, idempotently, and fails on a pool whose create did not finish.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_pool_cluster tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    pool: "t-{{ lxd_run_id }}-cpool"
+    pending_pool: "t-{{ lxd_run_id }}-ppend"
+    errored_pool: "t-{{ lxd_run_id }}-perr"
+  block:
+    - name: "S5: build member_config"
+      ansible.builtin.set_fact:
+        s5_member_config: "{{ s5_member_config | default({}) | combine({item.0: {'source': item.1}}) }}"
+      loop: "{{ lxd_members | zip(lxd_cluster_pool_dirs) | list }}"
+
+    - name: "S5: create a dir pool with its own source on each member"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+        config:
+          rsync.bwlimit: 10MB
+        member_config: "{{ s5_member_config }}"
+      register: s5_result
+
+    - name: "S5: read the pool on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/storage-pools/{{ pool }}?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: s5_server
+
+    - name: "S5: each member has its own source, and the global key is set"
+      ansible.builtin.assert:
+        that:
+          - s5_result is changed
+          - s5_result.storage_pool.status == 'Created'
+          - s5_server.results | map(attribute='json.metadata.config.source') | list == lxd_cluster_pool_dirs
+          # Keys with dots need item access. An attribute path would read the dots as nesting.
+          - s5_server.results | map(attribute='json.metadata.config') | map('dict2items') | flatten
+            | selectattr('key', 'eq', 'rsync.bwlimit') | map(attribute='value') | list == ['10MB', '10MB', '10MB']
+        fail_msg: "{{ s5_server.results | map(attribute='json.metadata.config') | list | to_json }}"
+
+    - name: "S6: run S5 again"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+        config:
+          rsync.bwlimit: 10MB
+        member_config: "{{ s5_member_config }}"
+      register: s6_result
+
+    - name: "S6: a second run on the cluster makes no change"
+      ansible.builtin.assert:
+        that:
+          - s6_result is not changed
+          - s6_result.storage_pool.members | length == lxd_members | length
+
+    - name: "S7: change a global key"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+      register: s7_result
+
+    - name: "S7: read the pool on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/storage-pools/{{ pool }}?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: s7_server
+
+    - name: "S7: every member has the new global value and keeps its source"
+      ansible.builtin.assert:
+        that:
+          - s7_result is changed
+          - s7_server.results | map(attribute='json.metadata.config') | map('dict2items') | flatten
+            | selectattr('key', 'eq', 'rsync.bwlimit') | map(attribute='value') | list == ['20MB', '20MB', '20MB']
+          - s7_server.results | map(attribute='json.metadata.config.source') | list == lxd_cluster_pool_dirs
+
+    - name: "S8: delete the pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      register: s8_result
+
+    - name: "S8: the pool is gone"
+      ansible.builtin.assert:
+        that:
+          - s8_result is changed
+
+    # A create that stops after the member step leaves the pool Pending.
+    - name: "S9: create a dir pool on one member only"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/storage-pools?target={{ lxd_members[0] }}"
+        method: POST
+        body:
+          name: "{{ pending_pool }}"
+          driver: dir
+    - name: "S9: the task for the Pending pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pending_pool }}"
+        driver: dir
+      register: s9_result
+      ignore_errors: true
+    - name: "S9: remove the Pending pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pending_pool }}"
+        state: absent
+      register: s9_absent
+
+    # A dir pool whose source is a file: the cluster step fails, and the pool is Errored.
+    - name: "S10: create a dir pool with a file as its source"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ errored_pool }}"
+        driver: dir
+        config:
+          source: /etc/hostname
+      register: s10_create
+      ignore_errors: true
+    - name: "S10: the same task again"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ errored_pool }}"
+        driver: dir
+        config:
+          source: /etc/hostname
+      register: s10_result
+      ignore_errors: true
+    - name: "S10: remove the Errored pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ errored_pool }}"
+        state: absent
+      register: s10_absent
+
+    - name: "S9 and S10: a pool whose create did not finish fails with its status, and state=absent removes it"
+      ansible.builtin.assert:
+        that:
+          - s9_result is failed
+          - "'has the status Pending' in s9_result.msg"
+          - s9_absent is changed
+          - s10_create is failed
+          - s10_result is failed
+          - "'has the status Errored' in s10_result.msg"
+          - s10_absent is changed
+  always:
+    - name: Remove the test pools
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ item }}"
+        state: absent
+      loop: ["{{ pool }}", "{{ pending_pool }}", "{{ errored_pool }}"]
+      failed_when: false

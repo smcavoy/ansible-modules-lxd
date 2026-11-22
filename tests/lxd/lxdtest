@@ -1,0 +1,1514 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Run the LXD integration targets and scenarios on nested LXD sandboxes.
+
+The runner lives in a container on the test server. It creates one sandbox VM per slot
+with the host LXD, runs targets and scenarios against the sandboxes, and deletes them.
+It uses only the Python standard library and the lxc client.
+
+The remote and the project have no built-in default. The runner reads them, in this order, from
+--remote and --project, from LXDTEST_REMOTE and LXDTEST_PROJECT, or from /etc/lxdtest/config.json.
+ci/bootstrap.py writes that file. LXDTEST_CONFIG names another file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import queue
+import random
+import shutil
+import signal
+import socket
+import ssl
+import string
+import subprocess
+import sys
+import threading
+import time
+import typing as t
+import urllib.error
+import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+CONFIG_FILE = Path(os.environ.get("LXDTEST_CONFIG", "/etc/lxdtest/config.json"))
+
+
+def setting(name: str, default: str = "") -> str:
+    """Return a setting from the environment, else from the config file of the bootstrap."""
+    value = os.environ.get(f"LXDTEST_{name.upper()}", "")
+    if value:
+        return value
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    return str(data.get(name) or default) if isinstance(data, dict) else default
+
+
+DEFAULT_REMOTE = setting("remote")
+DEFAULT_PROJECT = setting("project")
+DEFAULT_IMAGE = setting("image", "sandbox/6.10.1")
+VENV = Path(os.environ.get("LXDTEST_VENV", "/opt/venv"))
+WORK = Path(os.environ.get("LXDTEST_WORK", "/srv/lxdtest/work"))
+PKI = Path(os.environ.get("LXDTEST_PKI", "/root/pki"))
+TEST_IMAGES = Path(os.environ.get("LXDTEST_IMAGES", "/srv/lxdtest/images"))
+LOCK_NAME = "lxdtest-lock"
+# The run lock expires this many minutes after its last renewal. The holder renews it every LOCK_BEAT_SECONDS,
+# so a lock whose holder died (a killed job, a crashed runner) frees itself soon.
+LOCK_MINUTES = 20
+LOCK_BEAT_SECONDS = 300
+# A VM with a Ceph OSD can take minutes to stop under load.
+DELETE_TIMEOUT = 300
+# A run deletes sandboxes of earlier runs that are older than this, after it takes the lock.
+# The limit keeps the sandboxes of a recent --keep-on-failure run for a person to look at.
+LEFTOVER_HOURS = 6
+
+
+def runner_cpus() -> int:
+    """Return the CPUs of this runner. LXD pins a container with a numeric limits.cpu to that many CPUs."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+SLOT_MEMORY_GIB = 3
+# The root disk of a sandbox VM in GiB. The file also sets the disk of the image build VM, and it is part of the
+# sandbox image alias, so a new size builds a new image (LXD refuses a root disk smaller than the image).
+# A full run measured 2.5 GiB in use per sandbox and at most 65 MiB written over the image.
+SANDBOX_ROOT_GIB = int(
+    next(line for line in (Path(__file__).resolve().parent / "sandbox" / "root-gib").read_text().splitlines() if line.strip() and not line.startswith("#"))
+)
+# The cluster fixture: three small members. With it, the run keeps at most two standalone slots,
+# so that it fits the 12-instance limit of the CI project, with the runner and the lock.
+CLUSTER_MEMBERS = 3
+CLUSTER_MEMBER_MEMORY_GIB = 2
+CLUSTER_SIDE_SLOTS = 2
+CLUSTER_POOL_DIRS = ("/srv/pools/p1", "/srv/pools/p2", "/srv/pools/p3")
+# The multicluster fixture: two single-member clusters, each with the default pool and network of the preseed.
+MULTI_MEMORY_GIB = 2
+# The MicroCloud fixture: three members with MicroCeph and MicroOVN, for tests with lxd/ovn or lxd/ceph.
+# The MicroCloud docs ask for 8 GiB per member for tests. 6 GiB is enough for one OSD and the OVN services.
+MICROCLOUD_MEMBERS = 3
+MICROCLOUD_CPU = 2
+MICROCLOUD_MEMORY_GIB = 6
+# MicroCeph and MicroOVN add snaps and logs. Run 1125 measured 2.5 GiB in use on a member.
+MICROCLOUD_ROOT_GIB = 10
+MICROCLOUD_CEPH_GIB = 8
+MICROCLOUD_TIMEOUT = 1500
+# The OVN uplink is a VLAN on the NIC of each member. LXD refuses a second NIC on the same managed bridge.
+# The members share the VLAN through the CI bridge. Its subnet has no real gateway. The tests need only traffic inside OVN.
+OVN_UPLINK_VLAN = 1000
+OVN_UPLINK_INTERFACE = "uplink0"
+OVN_UPLINK_GATEWAY = "10.251.0.1/24"
+OVN_UPLINK_RANGE = "10.251.0.100-10.251.0.199"
+CALL_TIMEOUT = 600
+SANDBOX_READY_TIMEOUT = 300
+
+
+def log(msg: str) -> None:
+    """Print one timestamped line."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
+    print(f"[{stamp}] {msg}", flush=True)
+
+
+class RunError(Exception):
+    """A fixture step failed."""
+
+
+# ----------------------------------------------------------------------
+# lxc helpers
+
+
+WRITE_VERBS = {
+    "launch", "init", "start", "stop", "restart", "create", "set", "unset", "add", "remove", "copy", "move",
+    "exec", "push", "publish", "import", "attach", "detach", "edit", "rename", "override",
+}
+
+
+def is_safe_to_repeat(args: tuple[str, ...]) -> bool:
+    """Return whether an lxc command can run twice with no harm: a read, or a forced delete."""
+    words = [arg for arg in args[:4] if not arg.startswith("-")]
+    if words and words[0] == "delete":
+        return True
+    return not any(word in WRITE_VERBS for word in words)
+
+
+def lock_expiry(minutes: int) -> str:
+    """Return the expiry time of a lock that lives O(minutes) from now."""
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)).isoformat()
+
+
+class LockBeat(threading.Thread):
+    """Renew the run lock every LOCK_BEAT_SECONDS while the run lives."""
+
+    def __init__(self, host: Host, owner: str) -> None:
+        super().__init__(name="lock-beat", daemon=True)
+        self.host = host
+        self.owner = owner
+        self.done = threading.Event()
+
+    def run(self) -> None:
+        while not self.done.wait(LOCK_BEAT_SECONDS):
+            try:
+                if not self.host.renew_lock(self.owner, LOCK_MINUTES):
+                    log(f"lock: {self.owner} no longer holds {LOCK_NAME}; renewal stops")
+                    return
+            except RunError as exc:
+                log(f"lock: renewal failed, trying again in {LOCK_BEAT_SECONDS} s: {exc}")
+
+    def stop(self) -> None:
+        self.done.set()
+
+
+class Host:
+    """The host LXD, reached with the lxc client and a restricted certificate."""
+
+    def __init__(self, remote: str, project: str) -> None:
+        self.remote = remote
+        self.project = project
+
+    def lxc(self, *args: str, timeout: int = CALL_TIMEOUT, check: bool = True, retry: bool | None = None) -> str:
+        """Run one lxc command with stdin closed and a time limit.
+
+        A read or a forced delete gets one retry. A write that creates or changes something gets none, because a retry after
+        a time limit can repeat a write that LXD already did. Use L(write) for such a write.
+        With O(check=False), a failure or a time limit returns an empty string and never raises.
+        """
+        cmd = ["lxc", *args, "--project", self.project]
+        if retry is None:
+            retry = is_safe_to_repeat(args)
+        attempts = 2 if retry else 1
+        last = ""
+        for attempt in range(attempts):
+            try:
+                proc = subprocess.run(
+                    cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+                )
+            except subprocess.TimeoutExpired:
+                last = f"timeout after {timeout} s"
+                continue
+            if proc.returncode == 0:
+                return proc.stdout
+            last = (proc.stderr or proc.stdout).strip()
+            if not check:
+                return ""
+            if attempt + 1 < attempts:
+                time.sleep(5)
+        if not check:
+            log(f"lxc {' '.join(args)}: {last}")
+            return ""
+        raise RunError(f"lxc {' '.join(args)} failed: {last}")
+
+    def write(self, *args: str, done: t.Callable[[], bool], timeout: int = CALL_TIMEOUT) -> None:
+        """Run one lxc write without a retry. When it fails, accept it if O(done) shows that LXD did the work anyway."""
+        try:
+            self.lxc(*args, timeout=timeout, retry=False)
+        except RunError as exc:
+            if not done():
+                raise
+            log(f"lxc {args[0]} reported an error, but the result is in place: {exc}")
+
+    def status(self, instance: str) -> str:
+        """Return the status of an instance, for example Running, or an empty string when it does not exist."""
+        for item in self.instances():
+            if item.get("name") == instance:
+                return str(item.get("status") or "")
+        return ""
+
+    def start(self, instance: str) -> None:
+        """Start an instance. Accept an instance that is already running."""
+        self.write("start", self.name(instance), done=lambda: self.status(instance) == "Running")
+
+    def name(self, instance: str) -> str:
+        """Return the remote-qualified instance name."""
+        return f"{self.remote}:{instance}"
+
+    def exec(self, instance: str, script: str, timeout: int = CALL_TIMEOUT) -> str:
+        """Run a shell script in an instance. The project flag goes before "--", so it does not reach the script."""
+        cmd = ["lxc", "exec", self.name(instance), "--project", self.project, "--", "sh", "-c", script]
+        try:
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise RunError(f"exec in {instance} took longer than {timeout} s") from exc
+        if proc.returncode != 0:
+            raise RunError(f"exec in {instance} failed: {(proc.stderr or proc.stdout).strip()[-500:]}")
+        return proc.stdout
+
+    def cpu_limit(self) -> int:
+        """Return the limits.cpu of the project, or 0 when it has none."""
+        value = self.lxc("project", "get", f"{self.remote}:{self.project}", "limits.cpu", check=False, timeout=60).strip()
+        return int(value) if value.isdigit() else 0
+
+    def instances(self) -> list[dict]:
+        """Return the instances of the project."""
+        return json.loads(self.lxc("list", f"{self.remote}:", "--format", "json", timeout=60))
+
+    def take_lock(self, owner: str, minutes: int, wait_seconds: int, adopt: str = "") -> None:
+        """Create the lock container. Wait while another run holds it.
+
+        With O(adopt), take over a lock whose owner is O(adopt). ci/bootstrap.py hands its lock to the test run this way.
+        """
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            expires = lock_expiry(minutes)
+            try:
+                self.lxc(
+                    "init", "--empty", self.name(LOCK_NAME),
+                    "-c", f"user.lock.owner={owner}", "-c", f"user.lock.expires={expires}",
+                    timeout=60, retry=False,
+                )
+                return
+            except RunError as exc:
+                if "already exists" not in str(exc):
+                    raise
+            if adopt and self.lock_owner() == adopt:
+                self.lxc("config", "set", self.name(LOCK_NAME), f"user.lock.owner={owner}", f"user.lock.expires={expires}", timeout=60)
+                log(f"Took over the lock from {adopt}.")
+                return
+            if self.lock_expired():
+                log("Lock is stale. Removing it.")
+                self.lxc("delete", self.name(LOCK_NAME), "--force", check=False)
+                continue
+            if time.monotonic() >= deadline:
+                raise RunError("test server busy: another run holds the lock")
+            log("Another run holds the lock. Waiting 60 s.")
+            time.sleep(60)
+
+    def renew_lock(self, owner: str, minutes: int) -> bool:
+        """Move the expiry of the lock on, if O(owner) still holds it. Return whether it did."""
+        if self.lock_owner() != owner:
+            return False
+        self.lxc("config", "set", self.name(LOCK_NAME), f"user.lock.expires={lock_expiry(minutes)}", timeout=60)
+        return True
+
+    def lock_owner(self) -> str:
+        """Return the owner of the current lock, or an empty string."""
+        return self.lxc("config", "get", self.name(LOCK_NAME), "user.lock.owner", check=False, timeout=60).strip()
+
+    def lock_expired(self) -> bool:
+        """Return whether the current lock is past its expiry."""
+        value = self.lxc("config", "get", self.name(LOCK_NAME), "user.lock.expires", check=False, timeout=60).strip()
+        if not value:
+            return False
+        try:
+            return datetime.datetime.fromisoformat(value) < datetime.datetime.now(datetime.timezone.utc)
+        except ValueError:
+            return True
+
+    def release_lock(self) -> None:
+        """Delete the lock container."""
+        self.lxc("delete", self.name(LOCK_NAME), "--force", check=False, timeout=60)
+
+
+# ----------------------------------------------------------------------
+# Sandbox API
+
+
+class Sandbox:
+    """One nested LXD server in a VM."""
+
+    def __init__(self, host: Host, name: str, image: str) -> None:
+        self.host = host
+        self.name = name
+        self.image = image
+        self.url = f"https://{name}:8443"
+        self.ip = ""
+        self.cert = str(PKI / "client.crt")
+        self.key = str(PKI / "client.key")
+
+    def context(self, server_cert: str | None = None) -> ssl.SSLContext:
+        """Return a TLS context with the client certificate."""
+        if server_cert:
+            ctx = ssl.create_default_context(cafile=server_cert)
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(self.cert, self.key)
+        return ctx
+
+    def api(self, method: str, path: str, body: object = None, data: bytes | None = None,
+            headers: dict | None = None, timeout: int = 60) -> dict:
+        """Call the sandbox API. Wait for an async operation."""
+        send = dict(headers or {})
+        payload = data
+        if body is not None:
+            payload = json.dumps(body).encode()
+            send["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.url + path, data=payload, method=method, headers=send)
+        with urllib.request.urlopen(req, context=self.context(), timeout=timeout) as resp:
+            env = json.loads(resp.read() or b"{}")
+        if env.get("type") == "async":
+            op = env["operation"].rsplit("/", 1)[-1]
+            req = urllib.request.Request(f"{self.url}/1.0/operations/{op}/wait?timeout=600", method="GET")
+            with urllib.request.urlopen(req, context=self.context(), timeout=660) as resp:
+                waited = json.loads(resp.read())
+            meta = waited.get("metadata") or {}
+            if meta.get("status") != "Success":
+                raise RunError(f"sandbox operation failed: {meta.get('err')}")
+            return meta
+        return env
+
+    def launch(self, cpu: int = 2, memory_gib: int = SLOT_MEMORY_GIB, extra: tuple[str, ...] = (), root_gib: int = SANDBOX_ROOT_GIB) -> None:
+        """Launch the sandbox VM."""
+        options: list[str] = []
+        for item in extra:
+            options += ["-c", item]
+        self.host.write(
+            "launch", self.image, self.host.name(self.name), "--vm",
+            "-c", f"limits.cpu={cpu}", "-c", f"limits.memory={memory_gib}GiB",
+            *options,
+            "-d", f"root,size={root_gib}GiB",
+            done=self.recover,
+        )
+
+    def recover(self) -> bool:
+        """After a failed launch, start the VM when LXD created it. Return whether it runs."""
+        status = self.host.status(self.name)
+        if status and status != "Running":
+            self.host.start(self.name)
+            status = self.host.status(self.name)
+        return status == "Running"
+
+    def wait_ready(self) -> None:
+        """Wait until the sandbox trusts the client certificate."""
+        deadline = time.monotonic() + SANDBOX_READY_TIMEOUT
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                env = self.api("GET", "/1.0", timeout=10)
+                if (env.get("metadata") or {}).get("auth") == "trusted":
+                    self.ip = socket.gethostbyname(self.name)
+                    MONITOR.add(self)
+                    return
+                last = "not trusted yet"
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                last = str(exc)
+            time.sleep(3)
+        raise RunError(f"sandbox {self.name} did not become ready in {SANDBOX_READY_TIMEOUT} s: {last}")
+
+    def server_cert(self, path: Path) -> str:
+        """Write the server certificate of the sandbox to O(path)."""
+        env = self.api("GET", "/1.0")
+        pem = ((env.get("metadata") or {}).get("environment") or {}).get("certificate") or ""
+        path.write_text(pem)
+        return str(path)
+
+    def upload_split_image(self, metadata: Path, rootfs: Path, alias: str) -> None:
+        """Upload a split image and give it an alias."""
+        boundary = uuid.uuid4().hex
+        parts = []
+        for field, path in (("metadata", metadata), ("rootfs", rootfs)):
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{path.name}\"\r\n"
+                f"Content-Type: application/octet-stream\r\n\r\n".encode() + path.read_bytes() + b"\r\n"
+            )
+        data = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        meta = self.api(
+            "POST", "/1.0/images", data=data,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "X-LXD-public": "false"},
+            timeout=300,
+        )
+        fingerprint = (meta.get("metadata") or {}).get("fingerprint")
+        if not fingerprint:
+            raise RunError("image upload returned no fingerprint")
+        self.api("POST", "/1.0/images/aliases", body={"name": alias, "target": fingerprint})
+
+    def diagnostics(self) -> None:
+        """Print the TCP reset counters of the sandbox.
+
+        TcpExtTCPAbortOnData counts data that came after LXD closed a socket, for example after a slow TLS handshake.
+        TcpExtTCPAbortOnTimeout counts downloads that LXD ended after the client stopped reading for 10 s.
+        """
+        script = (
+            "nstat -az 2>/dev/null "
+            "| grep -E '^(TcpExtTCPAbortOn[A-Za-z]+|TcpOutRsts|TcpEstabResets|TcpAttemptFails|TcpExtListenOverflows|TcpExtListenDrops)[[:space:]]' "
+            "| awk '{printf \"%s=%s \", $1, $2} END {print \"\"}'"
+        )
+        try:
+            out = self.host.exec(self.name, script, timeout=60)
+        except RunError as exc:
+            out = f"no diagnostics: {exc}"
+        for line in out.strip().splitlines():
+            log(f"PROBE {self.name}: {line}")
+        guarded(f"disk use of {self.name}", self.disk_use)
+
+    def disk_use(self) -> None:
+        """Print the disk use of the sandbox: what the guest uses now, and what the volumes hold on the host.
+
+        The volume number of a VM grows with each new block that the guest writes, so it is close to the peak.
+        The sizes of the root disks come from these numbers (see the DISK lines in a full run).
+        """
+        gib = 1024**3
+        try:
+            guest = self.host.exec(self.name, "df -B1 --output=used,size / | tail -1", timeout=60).split()
+            log(f"PROBE {self.name}: DISK guest root used {int(guest[0]) / gib:.1f} GiB of {int(guest[1]) / gib:.1f} GiB")
+        except (RunError, ValueError, IndexError) as exc:
+            log(f"PROBE {self.name}: DISK guest unknown: {exc}")
+        try:
+            # lxc info prints "Disk usage:" and one "  <device>: <size>" line per disk.
+            info = self.host.lxc("info", self.host.name(self.name), timeout=60)
+            block = info.split("Disk usage:", 1)[1] if "Disk usage:" in info else ""
+            lines = []
+            for line in block.splitlines()[1:]:
+                if not line.startswith("    "):
+                    break  # The next section, for example "Disk total:".
+                lines.append(line.strip())
+            for line in lines or ["none: not reported"]:
+                log(f"PROBE {self.name}: DISK volume {line}")
+        except RunError as exc:
+            log(f"PROBE {self.name}: DISK volume unknown: {exc}")
+
+    def delete(self) -> None:
+        """Delete the sandbox VM."""
+        if self.ip:
+            guarded(f"probe of {self.name}", lambda: MONITOR.remove(self))
+            guarded(f"diagnostics of {self.name}", self.diagnostics)
+            self.ip = ""
+        self.host.lxc("delete", self.host.name(self.name), "--force", check=False, timeout=DELETE_TIMEOUT)
+
+
+# ----------------------------------------------------------------------
+# Probe for the connection resets
+
+
+class ConnMonitor:
+    """Measure TLS handshakes to the sandboxes and the scheduling stalls of the runner.
+
+    LXD closes a connection whose TLS handshake takes longer than 3 s (the ReadHeaderTimeout of its HTTP server).
+    The numbers show how close a run comes to that limit.
+    """
+
+    TICK = 1.0
+    PROBE_EVERY = 5
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.sandboxes: list[Sandbox] = []
+        self.samples: dict[str, list[float]] = {}
+        self.errors: dict[str, list[str]] = {}
+        self.stalls: list[tuple[float, str]] = []
+        self.ticks = 0
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def add(self, sandbox: Sandbox) -> None:
+        """Start to probe a sandbox."""
+        with self.lock:
+            self.sandboxes.append(sandbox)
+            self.samples.setdefault(sandbox.name, [])
+            self.errors.setdefault(sandbox.name, [])
+
+    def remove(self, sandbox: Sandbox) -> None:
+        """Stop to probe a sandbox and print its numbers."""
+        with self.lock:
+            if sandbox in self.sandboxes:
+                self.sandboxes.remove(sandbox)
+        self.report(sandbox.name)
+
+    def start(self) -> None:
+        """Start the probe thread."""
+        log(f"PROBE runner pressure at start: {self.pressure()}")
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def finish(self) -> None:
+        """Stop the probe thread and print the stalls of the runner."""
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=60)
+        log(f"PROBE runner pressure at end: {self.pressure()}")
+        stalls = sorted(self.stalls, key=lambda item: -item[0])
+        over = {limit: sum(1 for value, _ in stalls if value >= limit) for limit in (1, 3, 10)}
+        log(f"PROBE runner stalls: {self.ticks} ticks, over 1 s {over[1]}, over 3 s {over[3]}, over 10 s {over[10]}")
+        for value, stamp in stalls[:10]:
+            log(f"PROBE runner stall {value:.1f} s at {stamp}")
+
+    @staticmethod
+    def pressure() -> str:
+        """Return the PSI totals of the runner cgroup, in seconds."""
+        parts = []
+        for kind in ("cpu", "memory", "io"):
+            for path in (Path(f"/sys/fs/cgroup/{kind}.pressure"), Path(f"/proc/pressure/{kind}")):
+                try:
+                    text = path.read_text()
+                except OSError:
+                    continue
+                for line in text.splitlines():
+                    fields = dict(item.split("=") for item in line.split()[1:])
+                    parts.append(f"{kind}.{line.split()[0]}={int(fields.get('total', '0')) / 1e6:.0f}s")
+                break
+        return " ".join(parts) or "not available"
+
+    def loop(self) -> None:
+        """Sleep one tick at a time. Record each oversleep. Probe each sandbox every few ticks."""
+        while not self.stop.is_set():
+            started = time.monotonic()
+            time.sleep(self.TICK)
+            late = time.monotonic() - started - self.TICK
+            self.ticks += 1
+            if late >= 0.5:
+                self.stalls.append((late, datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
+            if self.ticks % self.PROBE_EVERY:
+                continue
+            with self.lock:
+                targets = list(self.sandboxes)
+            for sandbox in targets:
+                self.probe(sandbox)
+
+    def probe(self, sandbox: Sandbox) -> None:
+        """Do one TLS handshake and one GET on a new connection. Record the handshake time or the error."""
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
+        phase = "connect"
+        try:
+            with socket.create_connection((sandbox.ip, 8443), timeout=30) as raw:
+                phase = "handshake"
+                started = time.monotonic()
+                with sandbox.context().wrap_socket(raw) as conn:
+                    shake = time.monotonic() - started
+                    phase = "request"
+                    conn.sendall(f"GET /1.0 HTTP/1.1\r\nHost: {sandbox.name}\r\nConnection: close\r\n\r\n".encode())
+                    phase = "response"
+                    data = b""
+                    while chunk := conn.recv(65536):
+                        data += chunk
+                    if not data.startswith(b"HTTP/1.1 200"):
+                        raise OSError(f"unexpected answer {data[:40]!r}")
+            with self.lock:
+                self.samples[sandbox.name].append(shake)
+        except (OSError, ssl.SSLError) as exc:
+            with self.lock:
+                self.errors[sandbox.name].append(f"{stamp} {phase}: {type(exc).__name__}: {exc}")
+
+    def report(self, name: str) -> None:
+        """Print the handshake numbers of one sandbox."""
+        with self.lock:
+            values = sorted(self.samples.get(name) or [])
+            errors = list(self.errors.get(name) or [])
+        if values:
+            p99 = values[min(len(values) - 1, int(len(values) * 0.99))]
+            slow = {limit: sum(1 for value in values if value >= limit) for limit in (1, 2, 3)}
+            log(
+                f"PROBE {name}: {len(values)} handshakes, median {values[len(values) // 2] * 1000:.0f} ms, p99 {p99 * 1000:.0f} ms, "
+                f"max {values[-1] * 1000:.0f} ms, over 1 s {slow[1]}, over 2 s {slow[2]}, over 3 s {slow[3]}, errors {len(errors)}"
+            )
+        for error in errors[:20]:
+            log(f"PROBE {name}: error {error}")
+
+
+MONITOR = ConnMonitor()
+
+
+# ----------------------------------------------------------------------
+# Tests
+
+
+class Test:
+    """One target or scenario."""
+
+    def __init__(self, kind: str, name: str, path: Path) -> None:
+        self.kind = kind
+        self.name = name
+        self.path = path
+        self.goal = ""
+        self.aliases: set[str] = set()
+        aliases_file = path / "aliases"
+        if aliases_file.exists():
+            self.aliases = {
+                line.strip() for line in aliases_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+        goal_file = path / ("main.yml" if kind == "scenario" else "tasks/main.yml")
+        if goal_file.exists():
+            for line in goal_file.read_text().splitlines():
+                if line.startswith("# Goal:"):
+                    self.goal = line[len("# Goal:"):].strip()
+                    break
+        self.status = "skip"
+        self.reason = ""
+        self.seconds = 0.0
+        self.log = ""
+
+    @property
+    def fixture(self) -> str:
+        """Return the fixture alias, for example C(lxd/standalone)."""
+        for alias in self.aliases:
+            if alias in ("lxd/standalone", "lxd/cluster", "lxd/cluster-new", "lxd/ovn", "lxd/ceph", "lxd/multicluster"):
+                return alias
+        return "lxd/standalone"
+
+
+def kill_group(pgid: int) -> None:
+    """Stop every process left in a process group."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def stop_old_processes(run_id: str) -> None:
+    """Stop processes that an earlier run left in the runner. Only the run that holds the lock calls this."""
+    mine = str(WORK / run_id)
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if str(WORK) + "/" in cmdline and mine not in cmdline:
+            try:
+                os.kill(int(entry.name), signal.SIGKILL)
+                log(f"stopped process {entry.name} of an earlier run: {cmdline[:120]}")
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def discover(collection: Path, names: list[str], kinds: set[str]) -> list[Test]:
+    """Find the targets and scenarios to run."""
+    tests: list[Test] = []
+    if "target" in kinds:
+        for path in sorted((collection / "tests/integration/targets").glob("*")):
+            if path.is_dir() and not path.name.startswith("setup_"):
+                tests.append(Test("target", path.name, path))
+    if "scenario" in kinds:
+        for path in sorted((collection / "tests/scenarios").glob("*")):
+            if (path / "main.yml").exists():
+                tests.append(Test("scenario", path.name, path))
+    if names:
+        tests = [test for test in tests if test.name in names]
+    return tests
+
+
+class Slot:
+    """One sandbox and one copy of the collection."""
+
+    def __init__(self, run: Run, number: int) -> None:
+        self.run = run
+        self.number = number
+        self.dir = run.dir / f"slot-{number}"
+        self.home = self.dir / "home"
+        self.collection = self.dir / "ansible_collections" / "smcavoy" / "lxd"
+        self.sandbox = Sandbox(run.host, f"sbx-{run.run_id}-{number}", run.args.image)
+        self.config = self.collection / "tests/integration/integration_config.yml"
+        self.failed = False
+        # The error text when the sandbox of this slot did not start. Such a slot runs no test.
+        self.start_error = ""
+
+    def prepare(self) -> None:
+        """Copy the collection, start the sandbox, and write the config."""
+        shutil.copytree(self.run.collection, self.collection, ignore=ignore_copy)
+        self.home.mkdir(parents=True, exist_ok=True)
+        log(f"slot {self.number}: launching {self.sandbox.name}")
+        started = time.monotonic()
+        self.sandbox.launch()
+        self.sandbox.wait_ready()
+        log(f"slot {self.number}: {self.sandbox.name} ready in {time.monotonic() - started:.0f} s at {self.sandbox.ip}")
+        server_cert = self.sandbox.server_cert(self.dir / "server.crt")
+        meta = TEST_IMAGES / "alpine-ct.meta"
+        root = TEST_IMAGES / "alpine-ct.root"
+        if meta.exists() and root.exists():
+            self.sandbox.upload_split_image(meta, root, "test/alpine-ct")
+        values = {
+            "lxd_url": self.sandbox.url,
+            "lxd_client_cert": self.sandbox.cert,
+            "lxd_client_key": self.sandbox.key,
+            "lxd_server_cert": server_cert,
+            "lxd_run_id": self.run.run_id,
+            "lxd_slot": self.number,
+            "lxd_sandbox_ip": self.sandbox.ip,
+            "lxd_sandbox_name": self.sandbox.name,
+            "lxd_fixture": "standalone",
+            # The host LXD of the sandbox VM, for targets that act inside the VM (lxd_fault_server).
+            "lxd_host_remote": self.run.host.remote,
+            "lxd_host_project": self.run.host.project,
+            "lxd_image_ct": "test/alpine-ct",
+            "lxd_image_ct_meta": str(meta),
+            "lxd_image_ct_rootfs": str(root),
+            "lxd_image_vm_meta": str(TEST_IMAGES / "alpine-vm.meta"),
+            "lxd_image_vm_rootfs": str(TEST_IMAGES / "alpine-vm.root"),
+            "lxd_pool": "default",
+            "lxd_members": [],
+        }
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(values, indent=2) + "\n")
+
+    def cleanup(self) -> None:
+        """Delete the sandbox of this slot."""
+        self.sandbox.delete()
+
+    def env(self) -> dict[str, str]:
+        """Return the environment for ansible commands."""
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(self.home),
+            "PATH": f"{VENV / 'bin'}:{env.get('PATH', '')}",
+            "ANSIBLE_COLLECTIONS_PATH": str(self.dir),
+            "ANSIBLE_FORCE_COLOR": "0",
+            "ANSIBLE_NOCOLOR": "1",
+            "ANSIBLE_PYTHON_INTERPRETER": str(VENV / "bin/python"),
+            "ANSIBLE_STDOUT_CALLBACK": "default",
+            "ANSIBLE_CALLBACK_RESULT_FORMAT": "yaml",
+            "ANSIBLE_SHOW_TASK_PATH_ON_FAILURE": "1",
+        })
+        return env
+
+    def execute(self, test: Test) -> None:
+        """Run one test on this slot. Mark the slot as failed when the test does not pass."""
+        if test.kind == "scenario":
+            cmd = [
+                str(VENV / "bin/ansible-playbook"), "-i", "localhost,", "-c", "local",
+                str(self.collection / "tests/scenarios" / test.name / "main.yml"),
+                "-e", f"@{self.config}",
+            ]
+            cwd = self.collection / "tests/scenarios" / test.name
+        else:
+            cmd = [
+                str(VENV / "bin/ansible-test"), "integration", "--allow-unsupported", "--local",
+                "--color", "no", test.name,
+            ]
+            cwd = self.collection
+        if self.run.args.verbose:
+            cmd.append("-vvv")
+        started = time.monotonic()
+        # The test gets its own process group. On a time limit, the runner stops the whole group, so that no playbook
+        # or module goes on against the sandbox while the next test runs.
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=self.run.args.timeout * 60)
+            test.log = out + err
+            test.status = "pass" if proc.returncode == 0 else "fail"
+            if proc.returncode != 0:
+                test.reason = last_failure(test.log)
+        except subprocess.TimeoutExpired:
+            kill_group(proc.pid)
+            out, err = proc.communicate()
+            test.log = (out or "") + (err or "")
+            test.status = "timeout"
+            test.reason = f"longer than {self.run.args.timeout} minutes"
+        finally:
+            kill_group(proc.pid)
+        test.seconds = time.monotonic() - started
+        (self.run.dir / "logs").mkdir(exist_ok=True)
+        (self.run.dir / "logs" / f"{test.kind}-{test.name}.log").write_text(test.log)
+        log(f"slot {self.number}: {test.status.upper():7} {test.kind} {test.name} ({test.seconds:.0f} s)")
+        if test.status != "pass":
+            self.failed = True
+
+
+class ClusterSlot(Slot):
+    """A slot with a cluster of three sandbox members, for tests with the alias lxd/cluster."""
+
+    def __init__(self, run: Run, number: int) -> None:
+        super().__init__(run, number)
+        self.members = [Sandbox(run.host, f"sbx-{run.run_id}-c{index}", run.args.image) for index in range(1, CLUSTER_MEMBERS + 1)]
+        self.sandbox = self.members[0]
+
+    def prepare(self) -> None:
+        """Start the members, form the cluster, and write the config."""
+        shutil.copytree(self.run.collection, self.collection, ignore=ignore_copy)
+        self.home.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        # The first-boot unit skips the preseed in cluster mode. It only sets the HTTPS address and trusts the test client.
+        for member in self.members:
+            log(f"slot {self.number}: launching cluster member {member.name}")
+            member.launch(cpu=1, memory_gib=CLUSTER_MEMBER_MEMORY_GIB, extra=("user.sandbox.mode=cluster",))
+        for member in self.members:
+            member.wait_ready()
+        self.form_cluster()
+        log(f"slot {self.number}: cluster of {len(self.members)} members ready in {time.monotonic() - started:.0f} s")
+        first = self.members[0]
+        meta = TEST_IMAGES / "alpine-ct.meta"
+        root = TEST_IMAGES / "alpine-ct.root"
+        if meta.exists() and root.exists():
+            first.upload_split_image(meta, root, "test/alpine-ct")
+        server_cert = first.server_cert(self.dir / "server.crt")
+        values = {
+            "lxd_url": first.url,
+            "lxd_client_cert": first.cert,
+            "lxd_client_key": first.key,
+            "lxd_server_cert": server_cert,
+            "lxd_run_id": self.run.run_id,
+            "lxd_slot": self.number,
+            "lxd_sandbox_ip": first.ip,
+            "lxd_sandbox_name": first.name,
+            "lxd_fixture": "cluster",
+            "lxd_members": [member.name for member in self.members],
+            "lxd_cluster_pool_dirs": list(CLUSTER_POOL_DIRS),
+            "lxd_pool": "",
+            "lxd_image_ct": "test/alpine-ct",
+        }
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(values, indent=2) + "\n")
+
+    def form_cluster(self) -> None:
+        """Form the cluster with lxc commands: enable on the first member, then join the others."""
+        first = self.members[0]
+        dirs = " ".join(CLUSTER_POOL_DIRS)
+        for member in self.members:
+            self.run.host.exec(member.name, f"mkdir -p {dirs}")
+        self.run.host.exec(
+            first.name,
+            f"lxc config set core.https_address {first.ip}:8443 </dev/null && "
+            f"lxc config set cluster.https_address {first.ip}:8443 </dev/null && "
+            f"lxc cluster enable {first.name} </dev/null",
+        )
+        for member in self.members[1:]:
+            token = self.run.host.exec(first.name, f"lxc cluster add {member.name} --quiet </dev/null").strip()
+            if not token:
+                raise RunError(f"no join token for {member.name}")
+            preseed = (
+                "cluster:\n"
+                "  enabled: true\n"
+                f"  server_name: {member.name}\n"
+                f"  server_address: {member.ip}:8443\n"
+                f"  cluster_token: {token}\n"
+            )
+            self.run.host.exec(
+                member.name,
+                "lxc config unset core.https_address </dev/null; "
+                f"printf '%s' '{preseed}' > /root/join.yaml && lxd init --preseed < /root/join.yaml && rm -f /root/join.yaml",
+            )
+        members = first.api("GET", "/1.0/cluster/members?recursion=1").get("metadata") or []
+        online = [item.get("server_name") for item in members if item.get("status") == "Online"]
+        if len(online) != len(self.members):
+            raise RunError(f"the cluster has {len(online)} online members, not {len(self.members)}: {online}")
+
+    def cleanup(self) -> None:
+        """Delete all members."""
+        for member in self.members:
+            member.delete()
+
+
+class NewClusterSlot(ClusterSlot):
+    """A slot with three sandbox servers in cluster mode that do not form a cluster, for tests with the alias lxd/cluster-new.
+
+    The lxd_cluster target forms the cluster itself.
+    """
+
+    def __init__(self, run: Run, number: int) -> None:
+        Slot.__init__(self, run, number)
+        self.members = [Sandbox(run.host, f"sbx-{run.run_id}-n{index}", run.args.image) for index in range(1, CLUSTER_MEMBERS + 1)]
+        self.sandbox = self.members[0]
+
+    def prepare(self) -> None:
+        """Start the servers and write the config. The servers stay standalone."""
+        shutil.copytree(self.run.collection, self.collection, ignore=ignore_copy)
+        self.home.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        for member in self.members:
+            log(f"slot {self.number}: launching new cluster server {member.name}")
+            member.launch(cpu=1, memory_gib=CLUSTER_MEMBER_MEMORY_GIB, extra=("user.sandbox.mode=cluster",))
+        for member in self.members:
+            member.wait_ready()
+        log(f"slot {self.number}: {len(self.members)} standalone servers ready in {time.monotonic() - started:.0f} s")
+        first = self.members[0]
+        values = {
+            "lxd_url": first.url,
+            "lxd_client_cert": first.cert,
+            "lxd_client_key": first.key,
+            "lxd_server_cert": first.server_cert(self.dir / "server-1.crt"),
+            "lxd_run_id": self.run.run_id,
+            "lxd_slot": self.number,
+            "lxd_sandbox_ip": first.ip,
+            "lxd_sandbox_name": first.name,
+            "lxd_fixture": "cluster-new",
+            "lxd_members": [member.name for member in self.members],
+            "lxd_member_urls": [member.url for member in self.members],
+            "lxd_member_ips": [member.ip for member in self.members],
+            "lxd_member_server_certs": [member.server_cert(self.dir / f"server-{index}.crt") for index, member in enumerate(self.members, 1)],
+            "lxd_pool": "",
+        }
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(values, indent=2) + "\n")
+
+
+class MultiClusterSlot(Slot):
+    """A slot with two single-member clusters, for tests with the alias lxd/multicluster.
+
+    Each member starts with the preseed, so it has the pool C(default) and the network C(lxdbr0).
+    Then the slot turns each server into a cluster of one member. Cluster A is the main server of the tests.
+    """
+
+    def __init__(self, run: Run, number: int) -> None:
+        super().__init__(run, number)
+        self.sandbox = Sandbox(run.host, f"sbx-{run.run_id}-ma", run.args.image)
+        self.peer = Sandbox(run.host, f"sbx-{run.run_id}-mb", run.args.image)
+
+    def prepare(self) -> None:
+        """Start both servers, make each a cluster, and write the config."""
+        shutil.copytree(self.run.collection, self.collection, ignore=ignore_copy)
+        self.home.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        for server in (self.sandbox, self.peer):
+            log(f"slot {self.number}: launching multicluster server {server.name}")
+            server.launch(cpu=1, memory_gib=MULTI_MEMORY_GIB)
+        meta = TEST_IMAGES / "alpine-ct.meta"
+        root = TEST_IMAGES / "alpine-ct.root"
+        for server in (self.sandbox, self.peer):
+            server.wait_ready()
+            self.run.host.exec(
+                server.name,
+                f"lxc config set core.https_address {server.ip}:8443 </dev/null && "
+                f"lxc config set cluster.https_address {server.ip}:8443 </dev/null && "
+                f"lxc cluster enable {server.name} </dev/null",
+            )
+            members = server.api("GET", "/1.0/cluster/members").get("metadata") or []
+            if len(members) != 1:
+                raise RunError(f"{server.name} is not a cluster of one member: {members}")
+            if meta.exists() and root.exists():
+                server.upload_split_image(meta, root, "test/alpine-ct")
+        log(f"slot {self.number}: two clusters ready in {time.monotonic() - started:.0f} s")
+        values = {
+            "lxd_url": self.sandbox.url,
+            "lxd_client_cert": self.sandbox.cert,
+            "lxd_client_key": self.sandbox.key,
+            "lxd_server_cert": self.sandbox.server_cert(self.dir / "server.crt"),
+            "lxd_run_id": self.run.run_id,
+            "lxd_slot": self.number,
+            "lxd_sandbox_ip": self.sandbox.ip,
+            "lxd_sandbox_name": self.sandbox.name,
+            "lxd_fixture": "multicluster",
+            "lxd_image_ct": "test/alpine-ct",
+            "lxd_pool": "default",
+            "lxd_members": [self.sandbox.name],
+            "lxd_peer_url": self.peer.url,
+            "lxd_peer_server_cert": self.peer.server_cert(self.dir / "peer.crt"),
+            "lxd_peer_ip": self.peer.ip,
+            "lxd_peer_name": self.peer.name,
+        }
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(values, indent=2) + "\n")
+
+    def cleanup(self) -> None:
+        """Delete both servers."""
+        self.sandbox.delete()
+        self.peer.delete()
+
+
+class MicroCloudSlot(Slot):
+    """A slot with a MicroCloud of three members, for tests with the alias lxd/ovn or lxd/ceph.
+
+    Each member has a VLAN interface without an address for the OVN uplink, and a block volume for one Ceph OSD.
+    The members run C(microcloud preseed) at the same time. Then the initiator trusts the test client.
+    """
+
+    def __init__(self, run: Run, number: int) -> None:
+        super().__init__(run, number)
+        self.members = [Sandbox(run.host, f"sbx-{run.run_id}-mc{index}", run.args.image) for index in range(1, MICROCLOUD_MEMBERS + 1)]
+        self.sandbox = self.members[0]
+        self.volumes: list[str] = []
+
+    def bridge(self) -> tuple[str, str, str]:
+        """Return the pool of the default profile, the CI bridge, and its IPv4 address with the prefix."""
+        host = self.run.host
+        pool = host.lxc("profile", "device", "get", f"{host.remote}:default", "root", "pool").strip()
+        network = host.lxc("profile", "device", "get", f"{host.remote}:default", "eth0", "network").strip()
+        address = host.lxc("network", "get", f"{host.remote}:{network}", "ipv4.address").strip()
+        if not (pool and network and "/" in address):
+            raise RunError(f"cannot read the pool, the bridge, or its address: {pool!r} {network!r} {address!r}")
+        return pool, network, address
+
+    def launch_member(self, member: Sandbox, pool: str) -> None:
+        """Create a member VM with the Ceph disk, then start it."""
+        host = self.run.host
+        volume = f"{member.name}-ceph"
+        host.write(
+            "storage", "volume", "create", f"{host.remote}:{pool}", volume, "--type=block", f"size={MICROCLOUD_CEPH_GIB}GiB",
+            done=lambda: bool(host.lxc("storage", "volume", "show", f"{host.remote}:{pool}", volume, check=False)),
+        )
+        self.volumes.append(volume)
+        host.write(
+            "init", self.run.args.image, host.name(member.name), "--vm",
+            "-c", f"limits.cpu={MICROCLOUD_CPU}", "-c", f"limits.memory={MICROCLOUD_MEMORY_GIB}GiB",
+            "-c", "user.sandbox.mode=microcloud",
+            "-d", f"root,size={MICROCLOUD_ROOT_GIB}GiB",
+            done=lambda: bool(host.status(member.name)),
+        )
+        host.write(
+            "config", "device", "add", host.name(member.name), "ceph", "disk", f"pool={pool}", f"source={volume}",
+            done=lambda: host.lxc("config", "device", "get", host.name(member.name), "ceph", "source", check=False).strip() == volume,
+        )
+        host.start(member.name)
+
+    def wait_booted(self, member: Sandbox) -> None:
+        """Wait until the first-boot unit of a member is done, and read its address."""
+        deadline = time.monotonic() + SANDBOX_READY_TIMEOUT
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                self.run.host.exec(member.name, "test -e /var/lib/lxd-sandbox/done", timeout=30)
+                member.ip = self.run.host.exec(member.name, "ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p'", timeout=30).strip()
+                if member.ip:
+                    return
+                last = "no address yet"
+            except RunError as exc:
+                last = str(exc)
+            time.sleep(5)
+        raise RunError(f"member {member.name} did not finish its first boot in {SANDBOX_READY_TIMEOUT} s: {last}")
+
+    def preseed(self, subnet: str) -> str:
+        """Return the MicroCloud preseed for all members."""
+        lines = [
+            f"initiator: {self.members[0].name}",
+            f"lookup_subnet: {subnet}",
+            "lookup_timeout: 300",
+            f"session_passphrase: lxdtest-{self.run.run_id}-{uuid.uuid4().hex}",
+            "session_timeout: 900",
+            "systems:",
+        ]
+        for member in self.members:
+            lines += [
+                f"- name: {member.name}",
+                f"  ovn_uplink_interface: {OVN_UPLINK_INTERFACE}",
+                "  storage:",
+                "    ceph:",
+                "    - path: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_lxd_ceph",
+                "      wipe: true",
+            ]
+        lines += [
+            "ovn:",
+            f"  ipv4_gateway: {OVN_UPLINK_GATEWAY}",
+            f"  ipv4_range: {OVN_UPLINK_RANGE}",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def prepare(self) -> None:
+        """Start the members, run MicroCloud on all of them, trust the test client, and write the config."""
+        shutil.copytree(self.run.collection, self.collection, ignore=ignore_copy)
+        self.home.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        pool, network, gateway = self.bridge()
+        log(f"slot {self.number}: MicroCloud on bridge {network} ({gateway}), Ceph volumes in pool {pool}")
+        for member in self.members:
+            log(f"slot {self.number}: launching MicroCloud member {member.name}")
+            self.launch_member(member, pool)
+        for member in self.members:
+            self.wait_booted(member)
+            self.run.host.exec(
+                member.name,
+                "nic=$(ip -4 -o route get 1.1.1.1 | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p') && "
+                f"ip link add link \"$nic\" name {OVN_UPLINK_INTERFACE} type vlan id {OVN_UPLINK_VLAN} && "
+                f"sysctl -qw net.ipv6.conf.{OVN_UPLINK_INTERFACE}.disable_ipv6=1 && ip link set {OVN_UPLINK_INTERFACE} up",
+                timeout=60,
+            )
+        log(f"slot {self.number}: members booted in {time.monotonic() - started:.0f} s")
+        net = gateway.split("/")[0].rsplit(".", 1)[0] + ".0/" + gateway.split("/")[1]
+        text = self.preseed(net)
+        errors: list[str] = []
+
+        def run_preseed(member: Sandbox) -> None:
+            try:
+                self.run.host.exec(
+                    member.name,
+                    f"printf '%s' '{text}' > /root/microcloud.yaml && microcloud preseed < /root/microcloud.yaml > /root/microcloud.log 2>&1 "
+                    "|| { tail -n 30 /root/microcloud.log; exit 1; }",
+                    timeout=MICROCLOUD_TIMEOUT,
+                )
+            except RunError as exc:
+                errors.append(f"{member.name}: {exc}")
+
+        threads = [threading.Thread(target=run_preseed, args=(member,), daemon=True) for member in self.members]
+        for thread in threads:
+            thread.start()
+            # The initiator must listen before the others look for it.
+            time.sleep(5)
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise RunError("microcloud preseed failed: " + " | ".join(errors))
+        log(f"slot {self.number}: MicroCloud formed in {time.monotonic() - started:.0f} s")
+        first = self.members[0]
+        self.run.host.exec(first.name, "lxc config trust add /etc/lxd-sandbox/client.crt --name test-client </dev/null")
+        first.wait_ready()
+        for member in self.members[1:]:
+            member.ip = member.ip or socket.gethostbyname(member.name)
+        cluster = first.api("GET", "/1.0/cluster/members?recursion=1").get("metadata") or []
+        online = [item.get("server_name") for item in cluster if item.get("status") == "Online"]
+        if len(online) != len(self.members):
+            raise RunError(f"the MicroCloud has {len(online)} online members, not {len(self.members)}: {online}")
+        # The RADOS gateway on the first member serves the cephobject pools of the bucket tests.
+        self.run.host.exec(first.name, "microceph enable rgw </dev/null", timeout=600)
+        self.run.host.exec(
+            first.name,
+            "for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:80/ && exit 0; sleep 5; done; echo 'the RADOS gateway does not answer'; exit 1",
+            timeout=400,
+        )
+        log(f"slot {self.number}: RADOS gateway ready in {time.monotonic() - started:.0f} s")
+        meta = TEST_IMAGES / "alpine-ct.meta"
+        root = TEST_IMAGES / "alpine-ct.root"
+        if meta.exists() and root.exists():
+            first.upload_split_image(meta, root, "test/alpine-ct")
+        values = {
+            "lxd_url": first.url,
+            "lxd_client_cert": first.cert,
+            "lxd_client_key": first.key,
+            "lxd_server_cert": first.server_cert(self.dir / "server.crt"),
+            "lxd_run_id": self.run.run_id,
+            "lxd_slot": self.number,
+            "lxd_sandbox_ip": first.ip,
+            "lxd_sandbox_name": first.name,
+            "lxd_fixture": "microcloud",
+            "lxd_image_ct": "test/alpine-ct",
+            "lxd_members": [member.name for member in self.members],
+            "lxd_pool": "remote",
+            "lxd_ceph_pool": "remote",
+            "lxd_ovn_uplink": "UPLINK",
+            "lxd_ovn_network": "default",
+            "lxd_rgw_endpoint": f"http://{first.ip}",
+        }
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(values, indent=2) + "\n")
+
+    def cleanup(self) -> None:
+        """Delete all members and their Ceph volumes."""
+        host = self.run.host
+        for member in self.members:
+            member.delete()
+        if self.volumes:
+            pool = host.lxc("profile", "device", "get", f"{host.remote}:default", "root", "pool", check=False).strip()
+            for volume in self.volumes:
+                host.lxc("storage", "volume", "delete", f"{host.remote}:{pool}", volume, check=False, timeout=120)
+
+
+def ignore_copy(directory: str, names: list[str]) -> list[str]:
+    """Leave out git data, results, and test output when the runner copies the collection."""
+    skip = {".git", ".nox", "ci-results", "__pycache__"}
+    result = [name for name in names if name in skip]
+    if directory.endswith("tests") and "output" in names:
+        result.append("output")
+    return result
+
+
+def last_failure(text: str) -> str:
+    """Return a short reason from an ansible log."""
+    for line in reversed(text.splitlines()):
+        if line.startswith(("fatal:", "failed:")) or "FAILED!" in line or "ERROR" in line:
+            return line.strip()[:300]
+    return "see the log"
+
+
+class Run:
+    """One run of the runner."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.run_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        self.dir = WORK / self.run_id
+        self.collection = Path(args.collection).resolve()
+        self.host = Host(args.remote, args.project)
+        self.results = Path(args.results).resolve()
+        self.slots: list[Slot] = []
+        # Each queue with the slots that take tests from it. Only the standalone queue has more than one slot.
+        self.queues: list[tuple[queue.Queue[Test], list[Slot]]] = []
+
+    def main(self) -> int:
+        """Run the selected tests. Return the exit code."""
+        kinds = {"scenario"} if self.args.scenarios_only else ({"target"} if self.args.targets_only else {"target", "scenario"})
+        tests = discover(self.collection, self.args.names, kinds)
+        unknown = sorted(set(self.args.names) - {test.name for test in tests})
+        if unknown:
+            raise RunError(f"unknown test names, or names of another kind: {', '.join(unknown)}")
+        built = ("lxd/standalone", "lxd/cluster", "lxd/cluster-new", "lxd/multicluster", "lxd/ovn", "lxd/ceph")
+        tests = [test for test in tests if test.fixture in built or self.skip(test, "needs a fixture that this runner does not build yet")]
+        runnable = [test for test in tests if test.status == "skip" and not test.reason]
+        if not runnable:
+            log("ERROR no test to run.")
+            self.report(tests)
+            return 2
+        self.dir.mkdir(parents=True, exist_ok=True)
+        standalone = [test for test in runnable if test.fixture == "lxd/standalone"]
+        cluster = [test for test in runnable if test.fixture == "lxd/cluster"]
+        new_cluster = [test for test in runnable if test.fixture == "lxd/cluster-new"]
+        multicluster = [test for test in runnable if test.fixture == "lxd/multicluster"]
+        microcloud = [test for test in runnable if test.fixture in ("lxd/ovn", "lxd/ceph")]
+        side_slots = min(self.args.slots, CLUSTER_SIDE_SLOTS) if cluster else self.args.slots
+        slots_wanted = max(1, min(side_slots, len(standalone))) if standalone else 0
+        log(
+            f"RUN {self.run_id}  tests {len(runnable)}  slots {slots_wanted}  cluster slot {'yes' if cluster else 'no'}"
+            f"  multicluster slot {'yes' if multicluster else 'no'}  microcloud slot {'yes' if microcloud else 'no'}"
+        )
+        owner = f"{socket.gethostname()}:{self.run_id}"
+        self.host.take_lock(owner, minutes=LOCK_MINUTES, wait_seconds=self.args.lock_wait * 60, adopt=self.args.lock_owner)
+        beat = LockBeat(self.host, owner)
+        beat.start()
+        log(f"lock: held as {owner}; it expires {LOCK_MINUTES} minutes after the last renewal")
+        try:
+            stop_old_processes(self.run_id)
+            collect_garbage(self.host, LEFTOVER_HOURS)
+        except Exception as exc:  # noqa: BLE001 - the cleanup of old runs must not stop this run
+            log(f"cleanup of earlier runs failed: {exc}")
+        slots = self.slots
+        MONITOR.start()
+        try:
+            jobs: queue.Queue[Test] = queue.Queue()
+            for test in sorted(standalone, key=lambda item: (item.kind != "scenario", item.name)):
+                jobs.put(test)
+            threads = []
+            standalone_slots: list[Slot] = []
+            self.queues.append((jobs, standalone_slots))
+            for number in range(1, slots_wanted + 1):
+                slot = Slot(self, number)
+                slots.append(slot)
+                standalone_slots.append(slot)
+                thread = threading.Thread(target=self.work, args=(slot, jobs), daemon=True)
+                thread.start()
+                threads.append(thread)
+            special: list[tuple[type[Slot], list[Test]]] = [(ClusterSlot, cluster), (MultiClusterSlot, multicluster)]
+            special_threads: list[tuple[threading.Thread, Slot]] = []
+            for slot_class, selected in special:
+                if not selected:
+                    continue
+                special_jobs: queue.Queue[Test] = queue.Queue()
+                for test in sorted(selected, key=lambda item: (item.kind != "scenario", item.name)):
+                    special_jobs.put(test)
+                special_slot = slot_class(self, len(slots) + 1)
+                slots.append(special_slot)
+                self.queues.append((special_jobs, [special_slot]))
+                thread = threading.Thread(target=self.work, args=(special_slot, special_jobs), daemon=True)
+                thread.start()
+                threads.append(thread)
+                special_threads.append((thread, special_slot))
+            if new_cluster:
+                # Three more members would pass the CPU limit next to the cluster slot. This slot waits for it and deletes its servers.
+                nc_jobs: queue.Queue[Test] = queue.Queue()
+                for test in sorted(new_cluster, key=lambda item: item.name):
+                    nc_jobs.put(test)
+                nc_slot = NewClusterSlot(self, len(slots) + 1)
+                slots.append(nc_slot)
+                self.queues.append((nc_jobs, [nc_slot]))
+                nc_after = [(thread, slot) for thread, slot in special_threads if isinstance(slot, ClusterSlot)]
+                thread = threading.Thread(target=self.work_after, args=(nc_slot, nc_jobs, nc_after), daemon=True)
+                thread.start()
+                threads.append(thread)
+            if microcloud:
+                # Start the MicroCloud at once only when the CPU limit of the project has room for it next to the other slots.
+                # The cluster-new slot runs at once when no cluster slot runs, so its members count then.
+                new_now = bool(new_cluster) and not cluster
+                cpus = runner_cpus() + 2 * slots_wanted + (CLUSTER_MEMBERS if cluster or new_now else 0) + (2 if multicluster else 0)
+                limit = self.host.cpu_limit()
+                after = special_threads if limit and cpus + MICROCLOUD_MEMBERS * MICROCLOUD_CPU > limit else []
+                if after:
+                    log(f"the MicroCloud slot waits for the cluster slots: {cpus} of {limit} CPUs are in use")
+                mc_jobs: queue.Queue[Test] = queue.Queue()
+                for test in sorted(microcloud, key=lambda item: (item.kind != "scenario", item.name)):
+                    mc_jobs.put(test)
+                mc_slot = MicroCloudSlot(self, len(slots) + 1)
+                slots.append(mc_slot)
+                self.queues.append((mc_jobs, [mc_slot]))
+                thread = threading.Thread(target=self.work_after, args=(mc_slot, mc_jobs, after), daemon=True)
+                thread.start()
+                threads.append(thread)
+            for thread in threads:
+                thread.join()
+            self.fail_stranded()
+        finally:
+            for test in runnable:
+                if test.status == "skip" and not test.reason:
+                    test.status = "error"
+                    test.reason = "not run"
+            if not (self.args.keep_on_failure and any(test.status != "pass" for test in runnable)):
+                for slot in slots:
+                    guarded(f"cleanup of slot {slot.number}", slot.cleanup)
+            guarded("probe summary", MONITOR.finish)
+            beat.stop()
+            guarded("lock release", self.host.release_lock)
+        return self.report(tests)
+
+    def skip(self, test: Test, reason: str) -> bool:
+        """Mark a test as skipped with a reason. Return True, so that the test stays in the report."""
+        test.status = "skip"
+        test.reason = reason
+        return True
+
+    def work_after(self, slot: Slot, jobs: queue.Queue[Test], wait_for: list[tuple[threading.Thread, Slot]]) -> None:
+        """Wait for other slots to finish, delete their servers to free the CPUs, then work like L(work).
+
+        With --keep-on-failure, the servers of a slot with a failed test stay. The project limit can then stop this slot.
+        """
+        for thread, other in wait_for:
+            thread.join()
+            if not (self.args.keep_on_failure and other.failed):
+                other.cleanup()
+        self.work(slot, jobs)
+
+    def fail_stranded(self) -> None:
+        """Mark the tests that no slot could run. Call this after all slot threads have ended.
+
+        A slot that started takes tests until its queue is empty. So a test is still in a queue only when every slot of
+        that queue did not start.
+        """
+        for jobs, slots in self.queues:
+            errors = "; ".join(f"slot {slot.number}: {slot.start_error}" for slot in slots if slot.start_error)
+            if not errors:
+                continue
+            while True:
+                try:
+                    test = jobs.get_nowait()
+                except queue.Empty:
+                    break
+                test.status = "error"
+                test.reason = f"the sandbox did not start: {errors}"
+
+    def work(self, slot: Slot, jobs: queue.Queue[Test]) -> None:
+        """Prepare one slot, then run tests from the queue.
+
+        A slot that does not start takes no test. Its tests stay in the queue for the other slots of the queue.
+        L(fail_stranded) marks the tests that are left when no slot of the queue started.
+        """
+        try:
+            slot.prepare()
+        except Exception as exc:  # noqa: BLE001 - any fixture error stops only this slot, and the thread ends cleanly
+            slot.start_error = f"{type(exc).__name__}: {exc}"
+            log(f"WARNING slot {slot.number}: the sandbox did not start, so this slot runs no test: {slot.start_error}")
+            return
+        while True:
+            try:
+                test = jobs.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                slot.execute(test)
+            except Exception as exc:  # noqa: BLE001 - a runner error fails this test, and the slot goes on
+                log(f"slot {slot.number}: runner error in {test.name}: {type(exc).__name__}: {exc}")
+                test.status = "error"
+                test.reason = f"runner: {type(exc).__name__}: {exc}"
+                slot.failed = True
+
+    def report(self, tests: list[Test]) -> int:
+        """Write the summary and the JUnit file. Return the exit code."""
+        self.results.mkdir(parents=True, exist_ok=True)
+        counts = {status: sum(1 for test in tests if test.status == status) for status in ("pass", "fail", "error", "timeout", "skip")}
+        not_started = [slot for slot in self.slots if slot.start_error]
+        summary = {
+            "run_id": self.run_id,
+            "counts": counts,
+            "slots_not_started": [{"slot": slot.number, "error": slot.start_error} for slot in not_started],
+            "tests": [
+                {"kind": t.kind, "name": t.name, "goal": t.goal, "status": t.status, "reason": t.reason, "seconds": round(t.seconds, 1)}
+                for t in tests
+            ],
+        }
+        (self.results / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        suite = ET.Element("testsuite", name="lxdtest", tests=str(len(tests)),
+                           failures=str(counts["fail"] + counts["timeout"]), errors=str(counts["error"]), skipped=str(counts["skip"]))
+        for test in tests:
+            case = ET.SubElement(suite, "testcase", classname=test.kind, name=test.name, time=f"{test.seconds:.1f}")
+            if test.status in ("fail", "timeout"):
+                ET.SubElement(case, "failure", message=test.reason).text = test.log[-20000:]
+            elif test.status == "error":
+                ET.SubElement(case, "error", message=test.reason)
+            elif test.status == "skip":
+                ET.SubElement(case, "skipped", message=test.reason)
+        ET.ElementTree(suite).write(self.results / "junit.xml", encoding="unicode", xml_declaration=True)
+        logs = self.dir / "logs"
+        if logs.exists():
+            shutil.copytree(logs, self.results / "logs", dirs_exist_ok=True)
+        print()
+        for test in tests:
+            reason = f"  {test.reason}" if test.reason and test.status != "pass" else ""
+            print(f"{test.status.upper():8} {test.kind:9} {test.name:32} {test.seconds:6.0f} s{reason}")
+        print(f"\nRUN {self.run_id}  " + "  ".join(f"{k} {v}" for k, v in counts.items()))
+        # A slot that did not start does not fail the run by itself: the result of the run is the result of its tests.
+        # The tests of such a slot ran on the other slots of its queue, or they are errors above.
+        for slot in not_started:
+            print(f"WARNING slot {slot.number} did not start, the run had fewer slots: {slot.start_error}")
+        if counts["error"]:
+            return 2
+        if counts["fail"] or counts["timeout"]:
+            return 1
+        return 0
+
+
+def guarded(what: str, action: t.Callable[[], object]) -> None:
+    """Run one cleanup step. Log an error and go on, so that the next steps still run."""
+    try:
+        action()
+    except Exception as exc:  # noqa: BLE001 - one failed cleanup step must not skip the others
+        log(f"{what} failed: {type(exc).__name__}: {exc}")
+
+
+def hours_value(text: str) -> float:
+    """Parse a number of hours, for example 6 or 6h."""
+    return float(text.removesuffix("h"))
+
+
+def gc(args: argparse.Namespace) -> int:
+    """Delete sandbox VMs and work directories older than the limit."""
+    collect_garbage(Host(args.remote, args.project), args.older_than)
+    return 0
+
+
+def collect_garbage(host: Host, hours: float) -> None:
+    """Delete sandbox VMs, their volumes and work directories older than O(hours)."""
+    limit = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    for inst in host.instances():
+        name = inst.get("name", "")
+        if not name.startswith("sbx-"):
+            continue
+        created = datetime.datetime.fromisoformat(inst["created_at"].replace("Z", "+00:00"))
+        if created < limit:
+            log(f"deleting {name}")
+            host.lxc("delete", host.name(name), "--force", check=False, timeout=DELETE_TIMEOUT)
+    pool = host.lxc("profile", "device", "get", f"{host.remote}:default", "root", "pool", check=False).strip()
+    if pool:
+        volumes = json.loads(host.lxc("storage", "volume", "list", f"{host.remote}:{pool}", "type=custom", "--format", "json", check=False) or "[]")
+        for volume in volumes:
+            name = volume.get("name", "")
+            created = datetime.datetime.fromisoformat((volume.get("created_at") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
+            if name.startswith("sbx-") and not volume.get("used_by") and created < limit:
+                log(f"deleting volume {name}")
+                host.lxc("storage", "volume", "delete", f"{host.remote}:{pool}", name, check=False)
+    if WORK.exists():
+        for path in WORK.iterdir():
+            if path.is_dir() and path.stat().st_mtime < limit.timestamp():
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def main() -> int:
+    """Parse the command line and run."""
+    parser = argparse.ArgumentParser(prog="lxdtest")
+    parser.add_argument("--remote", default=DEFAULT_REMOTE)
+    parser.add_argument("--project", default=DEFAULT_PROJECT)
+    sub = parser.add_subparsers(dest="command", required=True)
+    run = sub.add_parser("run", help="Run targets and scenarios.")
+    run.add_argument("names", nargs="*", help="Target or scenario names. Empty means all.")
+    run.add_argument("--collection", default=str(Path(__file__).resolve().parents[2]))
+    run.add_argument("--slots", type=int, default=4)
+    run.add_argument("--image", default=DEFAULT_IMAGE)
+    run.add_argument("--results", default="ci-results")
+    run.add_argument("--timeout", type=int, default=20, help="Minutes per test.")
+    run.add_argument("--lock-wait", type=int, default=120, help="Minutes to wait for the lock.")
+    run.add_argument("--keep-on-failure", action="store_true")
+    run.add_argument("--lock-owner", default="", help="Take over a lock with this owner, for example from ci/bootstrap.py.")
+    run.add_argument("--scenarios-only", action="store_true")
+    run.add_argument("--targets-only", action="store_true")
+    run.add_argument("-v", "--verbose", action="store_true")
+    clean = sub.add_parser("gc", help="Delete old sandboxes and work directories.")
+    clean.add_argument("--older-than", type=hours_value, default=6, help="Hours, for example 6 or 6h.")
+    args = parser.parse_args()
+    if not args.remote or not args.project:
+        parser.error(f"set --remote and --project, LXDTEST_REMOTE and LXDTEST_PROJECT, or {CONFIG_FILE} (ci/bootstrap.py writes it)")
+    try:
+        if args.command == "gc":
+            return gc(args)
+        # A SIGTERM (a stopped job or runner) ends the run through its finally blocks: cleanup and lock release.
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+        return Run(args).main()
+    except RunError as exc:
+        log(f"ERROR {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

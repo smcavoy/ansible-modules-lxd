@@ -1,0 +1,215 @@
+# Goal: lxd_server_config updates server keys idempotently, keeps the HTTPS address in exact mode, and masks secrets.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_server_config tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200]
+  vars:
+    server_url: "{{ lxd_url }}/1.0"
+  block:
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: one
+          images.auto_update_interval: 12
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+      register: c4_server
+      # LXD can reset a connection right after a change to its config.
+      until: c4_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "C4: the diff shows the keys, and the server keeps the old values"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.config['user.t1'] == 'one'
+          - c4_result.diff.after.config['images.auto_update_interval'] == '12'
+          - "'user.t1' not in c4_server.json.metadata.config"
+
+    - name: "C5: set the keys"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: one
+          images.auto_update_interval: 12
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+      register: c5_server
+      # LXD can reset a connection right after a change to its config.
+      until: c5_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "C5: the module sets the keys"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config['user.t1'] == 'one'
+          - c5_server.json.metadata.config['images.auto_update_interval'] == '12'
+
+    # The default of images.auto_update_interval is 6. LXD does not store a key at its default value, so the test uses 12.
+    - name: "SC3: run C5 again with the number value"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: one
+          images.auto_update_interval: 12
+      register: sc3_result
+
+    - name: "SC3: a number equals its string, so a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - sc3_result is not changed
+
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+        method: PATCH
+        body:
+          config:
+            user.other: set-by-api
+
+    - name: "C6: run without the key in merge mode"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: one
+      register: c6_result
+
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+      register: c6_server
+      # LXD can reset a connection right after a change to its config.
+      until: c6_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "C6: merge keeps keys that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: one
+          images.auto_update_interval: 12
+        config_mode: exact
+      register: c7_result
+
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+      register: c7_server
+      # LXD can reset a connection right after a change to its config.
+      until: c7_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "C7 and SC1: exact removes unmanaged keys, keeps the HTTPS address, and the server still answers"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+          - c7_server.json.metadata.config['core.https_address'] == c5_server.json.metadata.config['core.https_address']
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ server_url }}"
+      register: c8_server
+      # LXD can reset a connection right after a change to its config.
+      until: c8_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'user.t1' not in c8_server.json.metadata.config"
+
+    - name: "C9: a list value"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: [a, b]
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'must be a string, a number, or a boolean' in c9_result.msg"
+
+    - name: "C9: member_config on a standalone server"
+      smcavoy.lxd.lxd_server_config:
+        member_config:
+          node1:
+            core.metrics_address: 127.0.0.1:9100
+      register: c9_member
+      ignore_errors: true
+
+    - name: "C9: member_config fails on a standalone server"
+      ansible.builtin.assert:
+        that:
+          - c9_member is failed
+          - "'only valid on a clustered server' in c9_member.msg"
+
+    - name: "SC2: set a secret key"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          oidc.client.secret: s3cret-value
+      diff: true
+      register: sc2_result
+
+    - name: "SC2: run again with the same secret"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          oidc.client.secret: s3cret-value
+      register: sc2_again
+
+    - name: "SC2: the result and the diff mask the secret, and the same secret makes no change"
+      ansible.builtin.assert:
+        that:
+          - sc2_result is changed
+          - sc2_result.config['oidc.client.secret'] == '********'
+          - sc2_result.diff.after.config['oidc.client.secret'] == '********'
+          - "'s3cret-value' not in (sc2_result | to_json)"
+          - sc2_again is not changed
+  always:
+    - name: Remove the test keys
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.t1: null
+          user.other: null
+          images.auto_update_interval: null
+          oidc.client.secret: null
+      failed_when: false

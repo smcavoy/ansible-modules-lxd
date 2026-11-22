@@ -1,0 +1,169 @@
+# Goal: lxd_cluster_member manages member fields and groups idempotently, and evacuates and restores a member.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_member tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    member: "{{ lxd_members[2] }}"
+    grp: "t-{{ lxd_run_id }}-mgrp"
+  block:
+    - name: Create a cluster group
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+
+    - name: "M1: check mode predicts a field change"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        description: test member
+        failure_domain: rack-t
+        groups: [default, "{{ grp }}"]
+        config:
+          user.test: one
+      check_mode: true
+      diff: true
+      register: m1_check
+
+    - name: "M1: change the fields"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        description: test member
+        failure_domain: rack-t
+        groups: [default, "{{ grp }}"]
+        config:
+          user.test: one
+      register: m1_result
+
+    - name: "M2: run M1 again with the groups in another order"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        description: test member
+        failure_domain: rack-t
+        groups: ["{{ grp }}", default]
+        config:
+          user.test: one
+      register: m2_result
+
+    - name: "M1 and M2: the fields change, the automatic roles stay, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - m1_check is changed
+          - m1_check.diff.after.failure_domain == 'rack-t'
+          - m1_result is changed
+          - m1_result.member.failure_domain == 'rack-t'
+          - m1_result.member.description == 'test member'
+          - m1_result.member.groups | sort == ['default', grp] | sort
+          - m1_result.member.config['user.test'] == 'one'
+          - m2_result is not changed
+
+    - name: "M2b: no custom roles on a member that has only automatic roles"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ item }}"
+        roles: []
+      loop: "{{ lxd_members }}"
+      register: m2b_result
+
+    - name: "M2b: read the members"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members?recursion=1"
+      register: m2b_server
+
+    - name: "M2b: the automatic roles of LXD (database-voter on a voter) are no difference"
+      ansible.builtin.assert:
+        that:
+          - m2b_result is not changed
+          - m2b_server.json.metadata | map(attribute='roles') | flatten | select('match', 'database-') | list | length >= 3
+
+    - name: "M3: an automatic role"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        roles: [database]
+      register: m3_result
+      ignore_errors: true
+
+    - name: "M3: a member that does not exist"
+      smcavoy.lxd.lxd_cluster_member:
+        name: no-such-member
+        description: x
+      register: m3_missing
+      ignore_errors: true
+
+    - name: "M3: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - m3_result is failed
+          - "'assigned by LXD' in m3_result.msg"
+          - m3_missing is failed
+          - "'not found' in m3_missing.msg"
+
+    - name: "M4: evacuate the member"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        state: evacuated
+        evacuate_mode: stop
+      register: m4_result
+
+    - name: "M4: evacuate again"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        state: evacuated
+      register: m4_again
+
+    - name: "M5: restore the member"
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+      register: m5_result
+
+    - name: "M5: read the member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members/{{ member }}"
+      register: m5_server
+
+    - name: "M4 and M5: evacuate, no change on a second evacuate, then restore"
+      ansible.builtin.assert:
+        that:
+          - m4_result is changed
+          - m4_result.member.status == 'Evacuated'
+          - m4_again is not changed
+          - m5_result is changed
+          - m5_server.json.metadata.status == 'Online'
+
+    - name: "M6: remove a member that is not in the cluster"
+      smcavoy.lxd.lxd_cluster_member:
+        name: no-such-member
+        state: absent
+      register: m6_result
+
+    - name: "M6: no change"
+      ansible.builtin.assert:
+        that:
+          - m6_result is not changed
+  always:
+    - name: Restore the member and reset its fields
+      smcavoy.lxd.lxd_cluster_member:
+        name: "{{ member }}"
+        description: ""
+        failure_domain: default
+        groups: [default]
+        config:
+          user.test: null
+      failed_when: false
+
+    - name: Remove the cluster group
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      failed_when: false

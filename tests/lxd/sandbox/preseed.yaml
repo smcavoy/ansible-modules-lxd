@@ -1,0 +1,29 @@
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# LXD setup of a test sandbox on first boot. ci/bootstrap.py puts this file into the sandbox image.
+config:
+  core.https_address: "[::]:8443"
+networks:
+  - name: lxdbr0
+    type: bridge
+    config:
+      ipv4.address: 10.99.0.1/24
+      ipv4.nat: "true"
+      ipv6.address: none
+storage_pools:
+  - name: default
+    driver: dir
+profiles:
+  - name: default
+    devices:
+      root:
+        type: disk
+        pool: default
+        path: /
+      eth0:
+        type: nic
+        network: lxdbr0
+        name: eth0

@@ -1,0 +1,219 @@
+# Goal: lxd_auth_group creates, updates, and deletes authorization groups idempotently, and compares permissions as a set.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_auth_group tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    grp: "t-{{ lxd_run_id }}-grp"
+    grp_url: "{{ lxd_url }}/1.0/auth/groups/t-{{ lxd_run_id }}-grp"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        description: "first"
+        permissions:
+          - entity_type: "server"
+            url: "/1.0"
+            entitlement: "viewer"
+          - entity_type: "project"
+            url: "/1.0/projects/default"
+            entitlement: "viewer"
+      check_mode: true
+      register: c1_result
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c1_server
+    - name: "C1: nothing exists yet"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+    - name: "C2: create"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        description: "first"
+        permissions:
+          - entity_type: "server"
+            url: "/1.0"
+            entitlement: "viewer"
+          - entity_type: "project"
+            url: "/1.0/projects/default"
+            entitlement: "viewer"
+      register: c2_result
+    - name: "C2: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c2_server
+    - name: "C2: the module creates it"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_server.status == 200
+          - c2_server.json.metadata.permissions | length == 2
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        description: "first"
+        permissions:
+          - entity_type: "server"
+            url: "/1.0"
+            entitlement: "viewer"
+          - entity_type: "project"
+            url: "/1.0/projects/default"
+            entitlement: "viewer"
+      register: c3_result
+    - name: "C3: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        description: "second"
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c4_server
+    - name: "C4: change predicted, server unchanged"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before != c4_result.diff.after
+          - c4_server.json.metadata.description == 'first'
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        description: "second"
+      register: c5_result
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c5_server
+    - name: "C5: the server has the new value"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.description == 'second'
+    - name: "C9: bad input"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        permissions:
+          - entity_type: "server"
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - '"missing required arguments" in c9_result.msg'
+    - name: "AG1: the same permissions in another order"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        permissions:
+          - entity_type: "project"
+            url: "/1.0/projects/default"
+            entitlement: "viewer"
+          - entity_type: "server"
+            url: "/1.0"
+            entitlement: "viewer"
+      register: ag1_result
+    - name: "AG1: no change"
+      ansible.builtin.assert:
+        that:
+          - ag1_result is not changed
+    - name: "AG2: merge one more permission"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        permissions:
+          - entity_type: "project"
+            url: "/1.0/projects/default"
+            entitlement: "operator"
+        permissions_mode: "merge"
+      register: ag2_result
+    - name: "AG2: merge keeps the old permissions"
+      ansible.builtin.assert:
+        that:
+          - ag2_result is changed
+          - ag2_result.auth_group.permissions | length == 3
+    - name: "AG3: a permission on an entity of the default project, without the project in the URL, two times"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        permissions:
+          - entity_type: "profile"
+            url: "/1.0/profiles/default"
+            entitlement: "can_view"
+        permissions_mode: "merge"
+      loop: [1, 2]
+      register: ag3_result
+    - name: "AG3: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: ag3_server
+    - name: "AG3: LXD adds project=default to the URL, and the second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - ag3_result.results[0] is changed
+          - ag3_result.results[1] is not changed
+          - "'/1.0/profiles/default?project=default' in (ag3_server.json.metadata.permissions | map(attribute='url') | list)"
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        state: "absent"
+      check_mode: true
+      register: c10_result
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c10_server
+    - name: "C10: it still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+    - name: "C11: delete"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        state: "absent"
+      register: c11_result
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c11_server
+    - name: "C11: it is gone"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_server.status == 404
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        state: "absent"
+      register: c12_result
+    - name: "C12: no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test object
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ grp }}"
+        state: "absent"
+      failed_when: false

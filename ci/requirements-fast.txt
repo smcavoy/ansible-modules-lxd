@@ -1,0 +1,11 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Pinned tools of the fast checks. A new release of a tool cannot break main without a change here.
+# ansible-core is not here: ci/run-fast.sh installs each version of CI_CORES in its own venv.
+nox==2026.10.20
+antsibull-nox==1.10.0
+antsibull-changelog==0.36.0
+ruff==0.17.4
+mypy==2.4.1

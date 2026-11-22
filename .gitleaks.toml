@@ -1,0 +1,38 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# gitleaks config: the default rules, with three allowlists for example values that are not secrets.
+# Each allowlist needs the path and the text of the line together. Run: gitleaks dir . --redact
+
+title = "smcavoy.lxd"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+# The specs show the start of a token as an example. Each one stops after a few characters and ends with "...".
+[[rules.allowlists]]
+description = "Example tokens in the specs, cut short with ..."
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)docs/design/specs/lxd_(auth_identity|auth_identity_token|cluster_join_token|cluster_link|trust_token)\.md$''']
+regexes = ['''(join_token|trust_token|token): eyJ[A-Za-z0-9]{10,40}\.\.\.''']
+
+# The cluster target joins with a wrong token to test the failure. The value is base64 of "not a token".
+[[rules.allowlists]]
+description = "A wrong join token in the lxd_cluster target"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/integration/targets/lxd_cluster/tasks/main\.yml$''']
+regexes = ['''cluster_token: bm90IGEgdG9rZW4=''']
+
+# A unit test gives a bucket key a made-up secret and checks that the result does not show it.
+[[rules.allowlists]]
+description = "A made-up bucket secret in a unit test"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/unit/plugins/modules/test_network_child_modules\.py$''']
+regexes = ['''my-0wn-s3cret''']

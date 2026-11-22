@@ -1,0 +1,216 @@
+# Goal: lxd_network_zone_record creates, updates, and deletes records idempotently, and compares entries as a set.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_zone_record tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    zone: "t-{{ lxd_run_id }}.rec.test"
+    rec_url: "{{ lxd_url }}/1.0/network-zones/{{ zone }}/records/www"
+    entry_a:
+      type: A
+      value: 192.0.2.10
+    entry_b:
+      type: A
+      value: 192.0.2.11
+      ttl: 300
+  block:
+    - name: Create the zone
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        entries: ["{{ entry_a }}"]
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ rec_url }}"
+      register: c1_server
+
+    - name: "C2: create the record with two entries"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        description: test record
+        entries: ["{{ entry_a }}", "{{ entry_b }}"]
+      register: c2_result
+
+    - name: "C3 and ZR1: run C2 again with the entries in another order"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        description: test record
+        entries: ["{{ entry_b }}", "{{ entry_a }}"]
+      register: c3_result
+
+    - name: "C1 to C3 and ZR1: check mode, create, and no change for another order"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.record.entries | length == 2
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an entry change"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        entries: ["{{ entry_a }}"]
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5: keep one entry"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        entries: ["{{ entry_a }}"]
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ rec_url }}"
+      register: c5_server
+
+    - name: "C4 and C5: the diff and the change"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.entries | length == 1
+          - c5_result is changed
+          - c5_server.json.metadata.entries | length == 1
+          - c5_server.json.metadata.entries[0].value == '192.0.2.10'
+          - c5_server.json.metadata.description == 'test record'
+
+    - name: "C6: add a user key with the API"
+      ansible.builtin.uri:
+        url: "{{ rec_url }}"
+        method: PUT
+        body:
+          description: "{{ c5_server.json.metadata.description }}"
+          entries: "{{ c5_server.json.metadata.entries }}"
+          config:
+            user.other: set-by-api
+
+    - name: "C6: run with another user key in merge mode"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        config:
+          user.mine: set-by-module
+      register: c6_result
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        config:
+          user.mine: set-by-module
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: remove the key with null"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        config:
+          user.mine: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ rec_url }}"
+      register: c8_server
+
+    - name: "C6 to C8: merge keeps, exact removes, null removes, and the entries stay"
+      ansible.builtin.assert:
+        that:
+          - c6_result is changed
+          - c6_result.record.config['user.other'] == 'set-by-api'
+          - c7_result is changed
+          - "'user.other' not in c7_result.record.config"
+          - c8_result is changed
+          - c8_server.json.metadata.config == {}
+          - c8_server.json.metadata.entries | length == 1
+
+    - name: "C9: a record in a missing zone"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: no.such.zone
+        name: www
+        entries: ["{{ entry_a }}"]
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'not found' in c9_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the record"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ rec_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.record is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the record
+      smcavoy.lxd.lxd_network_zone_record:
+        zone: "{{ zone }}"
+        name: www
+        state: absent
+      failed_when: false
+
+    - name: Remove the zone
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        state: absent
+      failed_when: false

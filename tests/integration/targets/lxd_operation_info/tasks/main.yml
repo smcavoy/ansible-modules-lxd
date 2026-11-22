@@ -1,0 +1,74 @@
+# Goal: lxd_operation_info lists operations, reads one by ID, filters by class, and hides token secrets.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_operation_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    token_name: "t-{{ lxd_run_id }}-opinfo"
+  block:
+    - name: Issue a trust token, which is a token operation
+      smcavoy.lxd.lxd_trust_token:
+        name: "{{ token_name }}"
+      register: token
+      no_log: true
+
+    - name: "I1: list the operations"
+      smcavoy.lxd.lxd_operation_info:
+      register: i1_result
+
+    - name: "I2: read the token operation by ID"
+      smcavoy.lxd.lxd_operation_info:
+        id: "{{ token.operation }}"
+      register: i2_result
+
+    - name: "I3: a missing ID"
+      smcavoy.lxd.lxd_operation_info:
+        id: 00000000-0000-0000-0000-000000000000
+      register: i3_result
+
+    - name: "I4 and OP2: token operations of all projects in check mode"
+      smcavoy.lxd.lxd_operation_info:
+        all_projects: true
+        class: token
+      check_mode: true
+      register: i4_result
+
+    - name: "OP2: running operations of the class task"
+      smcavoy.lxd.lxd_operation_info:
+        class: task
+        status:
+          - Running
+      register: op2_tasks
+
+    - name: "I2: log the token operation without secrets"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT token-operation {{ i2_result.operations | to_json }}"
+
+    - name: "I1 to I4 and OP1 to OP2: the list holds the token, the ID works, no item has a secret, and the class filter works"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - token.operation in (i1_result.operations | map(attribute='id') | list)
+          - i2_result.operations | length == 1
+          - i2_result.operations[0].class == 'token'
+          - i2_result.operations[0].metadata.secret is not defined
+          - i3_result.operations == []
+          - i4_result is not changed
+          - token.operation in (i4_result.operations | map(attribute='id') | list)
+          - i4_result.operations | rejectattr('class', 'eq', 'token') | list == []
+          - i4_result.operations | map(attribute='metadata') | selectattr('secret', 'defined') | list == []
+          - op2_tasks.operations | rejectattr('class', 'eq', 'task') | list == []
+  always:
+    - name: Revoke the token
+      smcavoy.lxd.lxd_trust_token:
+        name: "{{ token_name }}"
+        state: absent
+      failed_when: false

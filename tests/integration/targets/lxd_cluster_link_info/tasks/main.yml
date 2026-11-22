@@ -1,0 +1,79 @@
+# Goal: lxd_cluster_link_info reads all links, one link, and the status of the members of the other cluster.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_link_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    on_a: "t-{{ lxd_run_id }}-ia"
+    on_b: "t-{{ lxd_run_id }}-ib"
+  block:
+    - name: Make a pending link on B
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ lxd_peer_url }}"
+        server_cert: "{{ lxd_peer_server_cert }}"
+        name: "{{ on_b }}"
+      register: pending
+      no_log: true
+
+    - name: Activate it on A
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        trust_token: "{{ pending.trust_token }}"
+
+    - name: "I1: read all links on A"
+      smcavoy.lxd.lxd_cluster_link_info:
+      register: i1_result
+
+    - name: "I2: read one link with its state"
+      smcavoy.lxd.lxd_cluster_link_info:
+        name: "{{ on_a }}"
+        include_state: true
+      register: i2_result
+
+    - name: "I3: read a link that does not exist"
+      smcavoy.lxd.lxd_cluster_link_info:
+        name: "{{ on_a }}-none"
+      register: i3_result
+
+    - name: "I4: check mode gives the same result"
+      smcavoy.lxd.lxd_cluster_link_info:
+        name: "{{ on_a }}"
+      check_mode: true
+      register: i4_result
+
+    - name: "CKI1: log the state"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT link-state {{ i2_result.links[0].state | to_json }}"
+
+    - name: "I1 to I4 and CKI1: the reads match, and the other member has a status"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - on_a in (i1_result.links | map(attribute='name') | list)
+          - i2_result.links | length == 1
+          - i2_result.links[0].state.cluster_link_members | length == 1
+          - i2_result.links[0].state.cluster_link_members[0].status | length > 0
+          - i3_result.links == []
+          - i4_result.links[0].name == on_a
+  always:
+    - name: Remove the link on A
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the link on B
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ lxd_peer_url }}"
+        server_cert: "{{ lxd_peer_server_cert }}"
+        name: "{{ on_b }}"
+        state: absent
+      failed_when: false

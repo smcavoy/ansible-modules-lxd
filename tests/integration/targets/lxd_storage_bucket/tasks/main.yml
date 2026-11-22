@@ -1,0 +1,302 @@
+# Goal: lxd_storage_bucket and lxd_storage_bucket_key manage buckets and keys on a cephobject pool, and return secrets only once.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_bucket and lxd_storage_bucket_key tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    pool: "t{{ lxd_run_id }}obj"
+    bucket: "t{{ lxd_run_id }}-bucket"
+    bucket_url: "{{ lxd_url }}/1.0/storage-pools/{{ pool }}/buckets/{{ bucket }}"
+  block:
+    - name: Create the cephobject pool
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: cephobject
+        config:
+          cephobject.radosgw.endpoint: "{{ lxd_rgw_endpoint }}"
+      register: pool_result
+
+    - name: "C1: check mode predicts a bucket"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ bucket_url }}"
+      register: c1_server
+
+    - name: "C2 and B1: create the bucket"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        description: test bucket
+        config:
+          size: 1GiB
+      register: c2_result
+      no_log: true
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        description: test bucket
+        config:
+          size: 1GiB
+      register: c3_result
+
+    - name: "C2: log the bucket without secrets"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT bucket {{ c2_result.bucket | to_json }} credential-keys={{ (c2_result.admin_credentials | default({})) | list | to_json }}"
+
+    - name: "C1 to C3 and B1: check mode does nothing, the create returns the admin credentials once, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.bucket.config.size == '1GiB'
+          - c2_result.admin_credentials.access_key | length > 0
+          - c2_result.admin_credentials.secret_key | length > 0
+          - c3_result is not changed
+          - c3_result.admin_credentials is not defined
+
+    - name: "C4 to C6: update the description and the size"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        description: bigger
+        config:
+          size: 2GiB
+      register: c6_result
+
+    - name: "C7: exact config keeps the volatile keys"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        config:
+          size: 2GiB
+        config_mode: exact
+      register: c7_result
+
+    - name: "C4 to C7: the bucket changed, and exact mode leaves the volatile keys alone"
+      ansible.builtin.assert:
+        that:
+          - c6_result is changed
+          - c6_result.bucket.description == 'bigger'
+          - c6_result.bucket.config.size == '2GiB'
+          - c7_result is not changed
+          - c7_result.bucket.config['volatile.uuid'] | length > 0
+
+    - name: "K1: check mode predicts a key"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: reader
+      check_mode: true
+      register: k1_result
+
+    - name: "K2 and BK2: create a read-only key"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: reader
+      register: k2_result
+      no_log: true
+
+    - name: "K3 and BK2: run K2 again"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: reader
+      register: k3_result
+
+    - name: "K4: a key with a fixed secret"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: fixed
+        role: admin
+        access_key: "FIXED{{ lxd_run_id | upper }}"
+        secret_key: "secret-{{ lxd_run_id }}-0123456789"
+      register: k4_result
+
+    - name: "BK3: run K4 again"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: fixed
+        role: admin
+        access_key: "FIXED{{ lxd_run_id | upper }}"
+        secret_key: "secret-{{ lxd_run_id }}-0123456789"
+      register: bk3_result
+
+    - name: "K5: change the secret and the role"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: fixed
+        role: read-only
+        secret_key: "secret-{{ lxd_run_id }}-9876543210"
+      register: k5_result
+      diff: true
+
+    - name: "K6: a key for a bucket that does not exist"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: nosuchbucket
+        name: reader
+      register: k6_result
+      ignore_errors: true
+
+    - name: "K1 to K6, BK2, BK3: keys, secrets once, fixed secrets, and a clear error"
+      ansible.builtin.assert:
+        that:
+          - k1_result is changed
+          - k2_result is changed
+          - k2_result.key.role == 'read-only'
+          - k2_result.secret_key | length > 0
+          - k2_result.access_key | length > 0
+          - k3_result is not changed
+          - k3_result.secret_key is not defined
+          - k4_result is changed
+          - k4_result.access_key == 'FIXED' ~ (lxd_run_id | upper)
+          - bk3_result is not changed
+          - k5_result is changed
+          - k5_result.diff.after.secret_key == 'changed'
+          - k5_result.diff.after.role == 'read-only'
+          - k6_result is failed
+          - "'not found in pool' in k6_result.msg"
+
+    - name: "B2: the admin key writes an object"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/s3_request.py", PUT, "{{ c2_result.bucket.s3_url }}/b2.txt", "hello"]
+      environment:
+        S3_ACCESS_KEY: "{{ c2_result.admin_credentials.access_key }}"
+        S3_SECRET_KEY: "{{ c2_result.admin_credentials.secret_key }}"
+      register: b2_put
+      changed_when: false
+      no_log: true
+
+    - name: "B2: the read-only key reads the object"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/s3_request.py", GET, "{{ c2_result.bucket.s3_url }}/b2.txt"]
+      environment:
+        S3_ACCESS_KEY: "{{ k2_result.access_key }}"
+        S3_SECRET_KEY: "{{ k2_result.secret_key }}"
+      register: b2_get
+      changed_when: false
+      no_log: true
+
+    - name: "BK1: the read-only key cannot write"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/s3_request.py", PUT, "{{ c2_result.bucket.s3_url }}/bk1.txt", "no"]
+      environment:
+        S3_ACCESS_KEY: "{{ k2_result.access_key }}"
+        S3_SECRET_KEY: "{{ k2_result.secret_key }}"
+      register: bk1_put
+      changed_when: false
+      no_log: true
+
+    - name: "B2 and BK1: log the S3 answers"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT s3 put={{ b2_put.stdout_lines | to_json }} get={{ b2_get.stdout_lines | to_json }} ro-put={{ bk1_put.stdout_lines | to_json }}"
+
+    - name: "B2 and BK1: the admin key writes, the read-only key reads, and the read-only key cannot write"
+      ansible.builtin.assert:
+        that:
+          - b2_put.stdout_lines[0] == '200'
+          - b2_get.stdout_lines == ['200', 'hello']
+          - bk1_put.stdout_lines[0] == '403'
+
+    - name: "B2: delete the object, so that the bucket is empty again"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/s3_request.py", DELETE, "{{ c2_result.bucket.s3_url }}/b2.txt"]
+      environment:
+        S3_ACCESS_KEY: "{{ c2_result.admin_credentials.access_key }}"
+        S3_SECRET_KEY: "{{ c2_result.admin_credentials.secret_key }}"
+      changed_when: false
+      no_log: true
+
+    - name: "K7: delete a key"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: reader
+        state: absent
+      register: k7_result
+
+    - name: "K8: delete it again"
+      smcavoy.lxd.lxd_storage_bucket_key:
+        pool: "{{ pool }}"
+        bucket: "{{ bucket }}"
+        name: reader
+        state: absent
+      register: k8_result
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the bucket"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ bucket_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        state: absent
+      register: c12_result
+
+    - name: "K7, K8, C10 to C12: key delete, check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - k7_result is changed
+          - k8_result is not changed
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.bucket is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the bucket
+      smcavoy.lxd.lxd_storage_bucket:
+        pool: "{{ pool }}"
+        name: "{{ bucket }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the cephobject pool
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      failed_when: false

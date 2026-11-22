@@ -1,0 +1,176 @@
+# Goal: lxd_auth_identity_token issues a working bearer token once, replaces it with force, and revokes it.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_auth_identity_token tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ident: "t-{{ lxd_run_id }}-bearer"
+  block:
+    - name: Create a bearer identity
+      smcavoy.lxd.lxd_auth_identity:
+        name: "{{ ident }}"
+        type: bearer
+
+    - name: "IT0: check mode predicts a token"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+      check_mode: true
+      register: it0_result
+
+    - name: "IT1: issue a token"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        expiry: 1d
+      register: it1_result
+      no_log: true
+
+    # The uri module sends no client certificate here, so only the bearer token can authenticate.
+    - name: "IT1: call the API with the token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ lxd_server_cert }}"
+        headers:
+          Authorization: "Bearer {{ it1_result.token }}"
+      register: it1_call
+      no_log: true
+
+    - name: "IT2: run again"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+      register: it2_result
+
+    - name: "IT0 to IT2: check mode issues none, the token works, and a second run issues none"
+      ansible.builtin.assert:
+        that:
+          - it0_result is changed
+          - it0_result.token is not defined
+          - it1_result is changed
+          - it1_result.token | length > 0
+          - not it1_result.identity.type.endswith('(pending)')
+          - it1_call.json.metadata.auth == 'trusted'
+          - it2_result is not changed
+          - it2_result.token is not defined
+
+    - name: "IT3: force a new token"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        force: true
+      register: it3_result
+      no_log: true
+
+    - name: "IT3: call the API with the old token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ lxd_server_cert }}"
+        headers:
+          Authorization: "Bearer {{ it1_result.token }}"
+        status_code: [200, 401, 403]
+      register: it3_old
+      no_log: true
+
+    - name: "IT3: call the API with the new token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ lxd_server_cert }}"
+        headers:
+          Authorization: "Bearer {{ it3_result.token }}"
+      register: it3_new
+      no_log: true
+
+    - name: "IT3: the old token no longer works, and the new one does"
+      ansible.builtin.assert:
+        that:
+          - it3_result is changed
+          - it3_old.status != 200 or it3_old.json.metadata.auth != 'trusted'
+          - it3_new.json.metadata.auth == 'trusted'
+
+    - name: "IT4: revoke the token"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        state: absent
+      register: it4_result
+
+    - name: "IT4: revoke again"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        state: absent
+      register: it4_again
+
+    - name: "IT4: call the API with the revoked token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ lxd_server_cert }}"
+        headers:
+          Authorization: "Bearer {{ it3_result.token }}"
+        status_code: [200, 401, 403]
+      register: it4_call
+      no_log: true
+
+    - name: "IT4: the identity is pending again, a second revoke makes no change, and the token fails"
+      ansible.builtin.assert:
+        that:
+          - it4_result is changed
+          - it4_result.identity.type.endswith('(pending)')
+          - it4_again is not changed
+          - it4_call.status != 200 or it4_call.json.metadata.auth != 'trusted'
+
+    - name: "IT6: issue a token that lives one minute"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        expiry: 1M
+      register: it6_result
+      no_log: true
+
+    - name: "IT6: run again while the token is valid"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        expiry: 1M
+      register: it6_again
+      no_log: true
+
+    - name: "IT6: wait until the token is expired"
+      ansible.builtin.pause:
+        seconds: 70
+
+    - name: "IT6: run again after the expiry time"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: "{{ ident }}"
+        expiry: 1H
+      register: it6_expired
+      no_log: true
+
+    - name: "IT6: a valid token makes no change, and an expired token gets a new one"
+      ansible.builtin.assert:
+        that:
+          - it6_result is changed
+          - it6_again is not changed
+          - it6_expired is changed
+          - it6_expired.token | length > 20
+          - it6_expired.token != it6_result.token
+
+    - name: "IT5: a missing identity"
+      smcavoy.lxd.lxd_auth_identity_token:
+        name: no-such-identity
+      register: it5_result
+      ignore_errors: true
+
+    - name: "IT5: a missing identity fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - it5_result is failed
+          - "'not found' in it5_result.msg"
+  always:
+    - name: Remove the bearer identity
+      smcavoy.lxd.lxd_auth_identity:
+        name: "{{ ident }}"
+        type: bearer
+        state: absent
+      failed_when: false

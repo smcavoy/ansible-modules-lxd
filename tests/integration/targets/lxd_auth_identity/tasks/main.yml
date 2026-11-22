@@ -1,0 +1,233 @@
+# Goal: lxd_auth_identity creates, updates, and deletes TLS identities idempotently, and returns a join token for a pending identity.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_auth_identity tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    idn: "t-{{ lxd_run_id }}-idn"
+    idn_grp: "t-{{ lxd_run_id }}-idn-grp"
+    idn_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/idn-{{ lxd_run_id }}"
+    idn_url: "{{ lxd_url }}/1.0/auth/identities/tls/t-{{ lxd_run_id }}-idn"
+  block:
+    - name: Make a directory for the client certificate
+      ansible.builtin.file:
+        path: "{{ idn_dir }}"
+        state: directory
+        mode: "0700"
+    - name: Make a client certificate
+      ansible.builtin.command:
+        argv: [openssl, req, -x509, -newkey, ec, -pkeyopt, "ec_paramgen_curve:secp384r1", -nodes,
+               -keyout, "{{ idn_dir }}/user.key", -out, "{{ idn_dir }}/user.crt", -days, "1", -subj, /CN=lxd-test, -addext, extendedKeyUsage=clientAuth]
+        creates: "{{ idn_dir }}/user.crt"
+    - name: "Create the group for the identity"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ idn_grp }}"
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        certificate: "{{ lookup('ansible.builtin.file', idn_dir ~ '/user.crt') }}"
+        groups:
+          - "{{ idn_grp }}"
+      check_mode: true
+      register: c1_result
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c1_server
+      retries: 3
+      delay: 2
+      until: c1_server is not failed
+    - name: "C1: nothing exists yet"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+    - name: "C2: create"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        certificate: "{{ lookup('ansible.builtin.file', idn_dir ~ '/user.crt') }}"
+        groups:
+          - "{{ idn_grp }}"
+      register: c2_result
+    - name: "C2: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c2_server
+      retries: 3
+      delay: 2
+      until: c2_server is not failed
+    - name: "C2: the module creates it"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_server.status == 200
+          - c2_server.json.metadata.groups == [idn_grp]
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        certificate: "{{ lookup('ansible.builtin.file', idn_dir ~ '/user.crt') }}"
+        groups:
+          - "{{ idn_grp }}"
+      register: c3_result
+    - name: "C3: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        groups: []
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c4_server
+      retries: 3
+      delay: 2
+      until: c4_server is not failed
+    - name: "C4: change predicted, server unchanged"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before != c4_result.diff.after
+          - c4_server.json.metadata.groups == [idn_grp]
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        groups: []
+      register: c5_result
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c5_server
+      retries: 3
+      delay: 2
+      until: c5_server is not failed
+    - name: "C5: the server has the new value"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.groups == []
+    - name: "C9: bad input"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}-nocert"
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - '"certificate or pending is required" in c9_result.msg'
+    - name: "AID1: a pending identity"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}-pending"
+        pending: true
+      register: aid1_result
+    - name: "AID1: the module returns a join token"
+      ansible.builtin.assert:
+        that:
+          - aid1_result is changed
+          - aid1_result.join_token | length > 20
+          - (aid1_result.join_token | b64decode | from_json).client_name == idn ~ '-pending'
+    - name: "AID1: remove the pending identity"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}-pending"
+        state: "absent"
+      register: aid1c_result
+    - name: "AID1: it is gone"
+      ansible.builtin.assert:
+        that:
+          - aid1c_result is changed
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        state: "absent"
+      check_mode: true
+      register: c10_result
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c10_server
+      retries: 3
+      delay: 2
+      until: c10_server is not failed
+    - name: "C10: it still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+    - name: "C11: delete"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        state: "absent"
+      register: c11_result
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ idn_url }}"
+      register: c11_server
+      retries: 3
+      delay: 2
+      until: c11_server is not failed
+    - name: "C11: it is gone"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_server.status == 404
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        state: "absent"
+      register: c12_result
+    - name: "C12: no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test object
+      smcavoy.lxd.lxd_auth_identity:
+        type: "tls"
+        name: "{{ idn }}"
+        state: "absent"
+      failed_when: false
+    - name: Remove the pending identity
+      smcavoy.lxd.lxd_auth_identity:
+        type: tls
+        name: "{{ idn }}-pending"
+        state: absent
+      failed_when: false
+    - name: Remove the group
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ idn_grp }}"
+        state: absent
+      failed_when: false
+    - name: Remove the certificate files
+      ansible.builtin.file:
+        path: "{{ idn_dir }}"
+        state: absent

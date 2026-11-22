@@ -1,0 +1,143 @@
+# Goal: lxd_auth_identity_provider_group maps a provider group to LXD groups idempotently.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_auth_identity_provider_group tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    ipg: "t-{{ lxd_run_id }}-ipg"
+    ipg_url: "{{ lxd_url }}/1.0/auth/identity-provider-groups/{{ ipg }}"
+    g1: "t-{{ lxd_run_id }}-g1"
+    g2: "t-{{ lxd_run_id }}-g2"
+  block:
+    - name: Create two LXD groups
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ item }}"
+      loop: ["{{ g1 }}", "{{ g2 }}"]
+
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: ["{{ g1 }}"]
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ ipg_url }}"
+      register: c1_server
+
+    - name: "C2: create the mapping with two groups"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: ["{{ g1 }}", "{{ g2 }}"]
+      register: c2_result
+
+    - name: "C3 and IPG1: run again with the groups in another order"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: ["{{ g2 }}", "{{ g1 }}"]
+      register: c3_result
+
+    - name: "C4: check mode predicts a change"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: ["{{ g2 }}"]
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5: keep one group"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: ["{{ g2 }}"]
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ ipg_url }}"
+      register: c5_server
+
+    - name: "C1 to C5 and IPG1: check mode, create, no change for another order, diff, and change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.identity_provider_group.groups | sort == [g1, g2] | sort
+          - c3_result is not changed
+          - c4_result is changed
+          - c4_result.diff.after.groups == [g2]
+          - c5_result is changed
+          - c5_server.json.metadata.groups == [g2]
+
+    - name: "C9: a group that does not exist"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        groups: [no-such-group]
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: LXD rejects the group"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the mapping"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ ipg_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.identity_provider_group is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the mapping
+      smcavoy.lxd.lxd_auth_identity_provider_group:
+        name: "{{ ipg }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the two groups
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ item }}"
+        state: absent
+      loop: ["{{ g1 }}", "{{ g2 }}"]
+      failed_when: false

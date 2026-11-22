@@ -1,0 +1,333 @@
+# Goal: lxd_network_acl creates, updates, and deletes ACLs idempotently, and compares rules as sets.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_acl tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    acl: "t-{{ lxd_run_id }}-acl"
+    acl_url: "{{ lxd_url }}/1.0/network-acls/{{ acl }}"
+    rule_http:
+      action: allow
+      protocol: tcp
+      destination_port: "80"
+    rule_ping:
+      action: allow
+      protocol: icmp4
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress:
+          - "{{ rule_http }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create the ACL"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        description: test acl
+        ingress:
+          - "{{ rule_http }}"
+          - "{{ rule_ping }}"
+      register: c2_result
+
+    - name: "C2: the module creates the ACL"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.acl.description == 'test acl'
+          - c2_result.acl.ingress | length == 2
+          - c2_result.acl.egress == []
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        description: test acl
+        ingress:
+          - "{{ rule_http }}"
+          - "{{ rule_ping }}"
+      register: c3_result
+
+    - name: "C3: a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "A1: the same rules in another order"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress:
+          - "{{ rule_ping }}"
+          - "{{ rule_http }}"
+      register: a1_result
+
+    - name: "A1: rule order makes no change"
+      ansible.builtin.assert:
+        that:
+          - a1_result is not changed
+
+    - name: "A2: a rule with state enabled set"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress:
+          - "{{ rule_http | combine({'state': 'enabled'}) }}"
+          - "{{ rule_ping }}"
+      register: a2_result
+
+    - name: "A2: the default state equals enabled"
+      ansible.builtin.assert:
+        that:
+          - a2_result is not changed
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        egress:
+          - action: drop
+            protocol: udp
+            destination_port: "53"
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the change, and the server keeps the old rules"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.egress == []
+          - c4_result.diff.after.egress | length == 1
+          - c4_server.json.metadata.egress == []
+
+    - name: "C5: add an egress rule"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        egress:
+          - action: drop
+            protocol: udp
+            destination_port: "53"
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c5_server
+
+    - name: "C5: the module adds the rule and keeps the ingress rules"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.egress | length == 1
+          - c5_server.json.metadata.egress[0].action == 'drop'
+          - c5_server.json.metadata.ingress | length == 2
+
+    - name: "C6: read the ACL before the API change"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c6_before
+
+    # LXD merges only the config on PATCH. It replaces description, ingress, and egress, so the request sends them too.
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+        method: PATCH
+        body:
+          description: "{{ c6_before.json.metadata.description }}"
+          ingress: "{{ c6_before.json.metadata.ingress }}"
+          egress: "{{ c6_before.json.metadata.egress }}"
+          config:
+            user.other: set-by-api
+
+    - name: "C6: run with another user key in merge mode"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        config:
+          user.mine: set-by-module
+      register: c6_result
+
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c6_server
+
+    - name: "C6: merge keeps keys that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+          - c6_server.json.metadata.config['user.mine'] == 'set-by-module'
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        config:
+          user.mine: set-by-module
+        config_mode: exact
+      register: c7_result
+
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c7_server
+
+    - name: "C7: exact removes unmanaged keys"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        config:
+          user.mine: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c8_server
+
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'user.mine' not in c8_server.json.metadata.config"
+
+    - name: "C9: a rule without an action"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress:
+          - protocol: tcp
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'rule 1 in ingress needs an action' in c9_result.msg"
+
+    - name: "A3: an empty ingress list removes all ingress rules"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress: []
+      register: a3_result
+
+    - name: "A3: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: a3_server
+
+    - name: "A3: the server has no ingress rules and keeps the egress rule"
+      ansible.builtin.assert:
+        that:
+          - a3_result is changed
+          - a3_server.json.metadata.ingress == []
+          - a3_server.json.metadata.egress | length == 1
+
+    - name: "A4: a rule with spaces in its lists, two times"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        ingress:
+          - action: allow
+            protocol: tcp
+            source: "10.0.0.1, 10.0.0.2"
+            destination_port: "80, 443"
+      loop: [1, 2]
+      register: a4_result
+
+    - name: "A4: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: a4_server
+
+    - name: "A4: LXD stores the lists without spaces, and the second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - a4_result.results[0] is changed
+          - a4_result.results[1] is not changed
+          - a4_server.json.metadata.ingress[0].destination_port == '80,443'
+          - a4_server.json.metadata.ingress[0].source == '10.0.0.1,10.0.0.2'
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c10_server
+
+    - name: "C10: the ACL still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the ACL"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ acl_url }}"
+      register: c11_server
+
+    - name: "C11: the module deletes the ACL"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.acl is none
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test ACL
+      smcavoy.lxd.lxd_network_acl:
+        name: "{{ acl }}"
+        state: absent
+      failed_when: false

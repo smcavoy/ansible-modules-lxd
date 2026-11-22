@@ -1,0 +1,252 @@
+# Goal: lxd_placement_group manages groups idempotently, keeps policy and rigor, spreads or packs instances, and refuses a fourth strict spread instance.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_placement_group tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      status_code: [200, 404]
+  vars:
+    pool: "t{{ lxd_run_id }}pgp"
+    spread: "t-{{ lxd_run_id }}-spread"
+    compact: "t-{{ lxd_run_id }}-compact"
+    group_url: "{{ lxd_url }}/1.0/placement-groups/{{ spread }}"
+    spread_names: ["t-{{ lxd_run_id }}-pg1", "t-{{ lxd_run_id }}-pg2", "t-{{ lxd_run_id }}-pg3", "t-{{ lxd_run_id }}-pg4"]
+    compact_names: ["t-{{ lxd_run_id }}-pc1", "t-{{ lxd_run_id }}-pc2"]
+    root:
+      root:
+        type: disk
+        path: /
+        pool: "{{ pool }}"
+  block:
+    - name: Create a dir pool for the containers
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+
+    - name: "C1: check mode predicts a group"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        policy: spread
+        rigor: strict
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ group_url }}"
+      register: c1_server
+
+    - name: "C2: create the group"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        description: one per member
+        policy: spread
+        rigor: strict
+        config:
+          user.extra: "1"
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        description: one per member
+        policy: spread
+        rigor: strict
+        config:
+          user.extra: "1"
+      register: c3_result
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        description: spread
+        config:
+          user.purpose: web
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5 and C6: change the description and add a key"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        description: spread
+        config:
+          user.purpose: web
+      register: c6_result
+
+    - name: "C7: exact config removes the user keys and keeps policy and rigor"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        config: {}
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: run C7 again"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        config: {}
+        config_mode: exact
+      register: c8_result
+
+    - name: "B1: a new group without rigor"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}-x"
+        policy: spread
+      register: b1_result
+      ignore_errors: true
+
+    - name: "C1 to C8 and B1: create, no change, update, exact mode that keeps policy and rigor, and a clear error"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.placement_group.config.policy == 'spread'
+          - c2_result.placement_group.config.rigor == 'strict'
+          - c3_result is not changed
+          - c4_result is changed
+          - c4_result.diff.after.description == 'spread'
+          - c6_result is changed
+          - c6_result.placement_group.config['user.extra'] == '1'
+          - c6_result.placement_group.config['user.purpose'] == 'web'
+          - c7_result is changed
+          - "c7_result.placement_group.config == {'policy': 'spread', 'rigor': 'strict'}"
+          - c8_result is not changed
+          - b1_result is failed
+          - b1_result.msg == 'policy and rigor are required to create a placement group'
+
+    - name: "PG1: create three containers in the spread group"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          placement.group: "{{ spread }}"
+        devices: "{{ root }}"
+        state: stopped
+      loop: "{{ spread_names[:3] }}"
+      register: pg1_result
+
+    - name: "PG3: a fourth container in the strict spread group"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ spread_names[3] }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          placement.group: "{{ spread }}"
+        devices: "{{ root }}"
+        state: stopped
+      register: pg3_result
+      ignore_errors: true
+
+    - name: "PG2: create a compact group"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ compact }}"
+        policy: compact
+        rigor: strict
+
+    - name: "PG2: create two containers in the compact group"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          placement.group: "{{ compact }}"
+        devices: "{{ root }}"
+        state: stopped
+      loop: "{{ compact_names }}"
+      register: pg2_result
+
+    - name: "C9: delete a group in use"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ compact }}"
+        state: absent
+      register: c9_result
+      ignore_errors: true
+
+    - name: "PG1 to PG3 and C9: log the facts"
+      ansible.builtin.debug:
+        msg: >-
+          LXDTEST-FACT placement spread={{ pg1_result.results | map(attribute='instance') | map(attribute='location') | list | to_json }}
+          compact={{ pg2_result.results | map(attribute='instance') | map(attribute='location') | list | to_json }}
+          pg3={{ pg3_result.msg | default('') | to_json }} c9={{ c9_result.msg | default('') | to_json }}
+
+    - name: "PG1 to PG3 and C9: spread uses three members, compact uses one, a fourth strict instance fails, and a used group stays"
+      ansible.builtin.assert:
+        that:
+          - pg1_result.results | map(attribute='instance') | map(attribute='location') | unique | list | length == 3
+          - pg2_result.results | map(attribute='instance') | map(attribute='location') | unique | list | length == 1
+          - pg3_result is failed
+          - c9_result is failed
+
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: "{{ spread_names + compact_names }}"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the group"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ group_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ spread }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.placement_group is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: "{{ spread_names + compact_names }}"
+      failed_when: false
+
+    - name: Remove the groups
+      smcavoy.lxd.lxd_placement_group:
+        name: "{{ item }}"
+        state: absent
+      loop: ["{{ spread }}", "{{ compact }}", "{{ spread }}-x"]
+      failed_when: false
+
+    - name: Remove the pool
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      failed_when: false

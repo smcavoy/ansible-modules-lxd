@@ -1,0 +1,206 @@
+# Goal: lxd_storage_volume_backup creates, downloads, and deletes volume backups idempotently, and the file imports as a new volume.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_volume_backup tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    vol: "t-{{ lxd_run_id }}-vbvol"
+    restored: "t-{{ lxd_run_id }}-vbnew"
+    backup_url: "{{ lxd_url }}/1.0/storage-pools/{{ lxd_pool }}/volumes/custom/{{ vol }}/backups/b1"
+  block:
+    - name: Create the volume
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        description: backup source
+
+    - name: Make a folder for the download
+      ansible.builtin.tempfile:
+        state: directory
+      register: bak_dir
+
+    - name: "C1: check mode predicts a backup"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        dest: "{{ bak_dir.path }}/b1.tar.gz"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ backup_url }}"
+      register: c1_server
+
+    - name: "C1: read the download"
+      ansible.builtin.stat:
+        path: "{{ bak_dir.path }}/b1.tar.gz"
+      register: c1_file
+
+    - name: "C2 and VB1: create and download the backup"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        volume_only: true
+        compression_algorithm: gzip
+        dest: "{{ bak_dir.path }}/b1.tar.gz"
+      register: c2_result
+
+    - name: "VB1: list the archive"
+      ansible.builtin.command:
+        cmd: tar -tzf {{ bak_dir.path }}/b1.tar.gz
+      register: vb1_list
+      changed_when: false
+
+    - name: "C3 and VB2: run C2 again"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        volume_only: true
+        compression_algorithm: gzip
+        dest: "{{ bak_dir.path }}/b1.tar.gz"
+      register: c3_result
+
+    - name: "C1 to C3, VB1, VB2: check mode does nothing, the backup is a tar archive, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - not c1_file.stat.exists
+          - c2_result is changed
+          - c2_result.backup.volume_only is true
+          - c2_result.size > 0
+          - vb1_list.stdout_lines | select('search', 'index.yaml') | list | length == 1
+          - c3_result is not changed
+
+    - name: "VB3: import the file as a new volume"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ restored }}"
+        source:
+          backup_path: "{{ bak_dir.path }}/b1.tar.gz"
+      register: vb3_result
+
+    - name: "VB3: import again"
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ restored }}"
+        source:
+          backup_path: "{{ bak_dir.path }}/b1.tar.gz"
+      register: vb3_again
+
+    - name: "VB3: the new volume exists with the description of the source, and a second import makes no change"
+      ansible.builtin.assert:
+        that:
+          - vb3_result is changed
+          - vb3_result.storage_volume.name == restored
+          - vb3_result.storage_volume.description == 'backup source'
+          - vb3_again is not changed
+
+    - name: "B1: a create-only option that differs"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        volume_only: false
+        optimized_storage: true
+      register: b1_result
+
+    - name: "B2: force a new download"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        dest: "{{ bak_dir.path }}/b1.tar.gz"
+        force_download: true
+      register: b2_result
+
+    - name: "B3: a volume that does not exist"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "t-{{ lxd_run_id }}-novol"
+        name: b1
+      register: b3_result
+      ignore_errors: true
+
+    - name: "B1 to B3: a warning, a forced download, and a clear error"
+      ansible.builtin.assert:
+        that:
+          - b1_result is not changed
+          - b1_result.warnings | default([]) | select('search', 'optimized_storage') | list | length == 1
+          - b2_result is changed
+          - b2_result.size == c2_result.size
+          - b3_result is failed
+          - "'not found' in b3_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the backup"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ backup_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_storage_volume_backup:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: b1
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.backup is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the volumes
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ vol }}"
+        - "{{ restored }}"
+      failed_when: false
+
+    - name: Remove the download folder
+      ansible.builtin.file:
+        path: "{{ bak_dir.path }}"
+        state: absent
+      when: bak_dir.path is defined

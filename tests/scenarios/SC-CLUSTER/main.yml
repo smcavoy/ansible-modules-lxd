@@ -1,0 +1,250 @@
+# Goal: SC-CLUSTER adds a pool, a network and groups to a cluster, places containers by target and placement group, and evacuates a member.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-CLUSTER placement, placement groups, evacuation and restore
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pool: "t{{ lxd_run_id }}scp"
+    net: "t{{ lxd_run_id }}scn"
+    group: "t-{{ lxd_run_id }}-scg"
+    placement: "t-{{ lxd_run_id }}-scpg"
+    spread_names: ["t-{{ lxd_run_id }}-sp1", "t-{{ lxd_run_id }}-sp2", "t-{{ lxd_run_id }}-sp3"]
+    names: ["t-{{ lxd_run_id }}-sc1", "t-{{ lxd_run_id }}-sc2", "t-{{ lxd_run_id }}-sc3"]
+    # Container 1 goes to member 1, container 2 to member 2, and container 3 to the group, which holds member 3 only.
+    targets: ["{{ lxd_members[0] }}", "{{ lxd_members[1] }}", "@{{ group }}"]
+    devices:
+      root:
+        type: disk
+        path: /
+        pool: "{{ pool }}"
+      eth0:
+        type: nic
+        network: "{{ net }}"
+        name: eth0
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-CLUSTER 1: read the members"
+          smcavoy.lxd.lxd_cluster_member_info:
+          register: sc_members
+
+        - name: "SC-CLUSTER 2: create a dir pool on all members"
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ pool }}"
+            driver: dir
+            description: SC-CLUSTER
+          register: sc_pool
+
+        - name: "SC-CLUSTER 3: create a bridge on all members"
+          smcavoy.lxd.lxd_network:
+            name: "{{ net }}"
+            type: bridge
+            description: SC-CLUSTER
+            config:
+              ipv6.address: none
+          register: sc_net
+
+        - name: "SC-CLUSTER 4: create a group with member 3"
+          smcavoy.lxd.lxd_cluster_group:
+            name: "{{ group }}"
+            description: SC-CLUSTER
+            members: ["{{ lxd_members[2] }}"]
+
+        - name: "SC-CLUSTER 5: start the containers on their targets"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item.0 }}"
+            target: "{{ item.1 }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices: "{{ devices }}"
+            wait_for:
+              - type: ipv4
+            wait_timeout: 240
+          loop: "{{ names | zip(targets) | list }}"
+          register: sc_started
+
+        - name: "SC-CLUSTER 6: write a marker into container 2"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ names[1] }}"
+            command: [sh, -c, "echo sc-cluster {{ lxd_run_id }} > /root/marker && sync"]
+
+        - name: "SC-CLUSTER 7: evacuate member 2, and move its containers"
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ lxd_members[1] }}"
+            state: evacuated
+            evacuate_mode: migrate
+          register: sc_evacuate
+
+        - name: "SC-CLUSTER 8: read the containers and the members after the evacuation"
+          smcavoy.lxd.lxd_instance_info:
+            name: "{{ names[1] }}"
+          register: sc_moved
+
+        - name: "SC-CLUSTER 9: read the member state"
+          smcavoy.lxd.lxd_cluster_member_info:
+            name: "{{ lxd_members[1] }}"
+          register: sc_evacuated
+
+        - name: "SC-CLUSTER 10: read the marker on the new member"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ names[1] }}"
+            command: [cat, /root/marker]
+          register: sc_marker
+
+        - name: "SC-CLUSTER 11: evacuate member 2 again"
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ lxd_members[1] }}"
+            state: evacuated
+            evacuate_mode: migrate
+          register: sc_evacuate_again
+
+        - name: "SC-CLUSTER 12: restore member 2"
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ lxd_members[1] }}"
+            state: present
+          register: sc_restore
+
+        - name: "SC-CLUSTER 13: read the containers after the restore"
+          smcavoy.lxd.lxd_instance_info:
+          register: sc_after
+
+        - name: "SC-CLUSTER 13a: create a strict spread placement group"
+          smcavoy.lxd.lxd_placement_group:
+            name: "{{ placement }}"
+            description: SC-CLUSTER
+            policy: spread
+            rigor: strict
+
+        - name: "SC-CLUSTER 13b: create three stopped containers in the placement group"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            config:
+              placement.group: "{{ placement }}"
+            devices: "{{ devices }}"
+            state: stopped
+          loop: "{{ spread_names }}"
+          register: sc_spread
+
+        - name: "SC-CLUSTER 14: log the facts"
+          ansible.builtin.debug:
+            msg: >-
+              LXDTEST-FACT sc-cluster moved={{ sc_moved.instances[0].location }}
+              status={{ sc_evacuated.members[0].status }}
+              after={{ sc_after.instances | selectattr('name', 'in', names) | map(attribute='location') | list | to_json }}
+
+        - name: "SC-CLUSTER 15: run the pool, network, group and container steps again"
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ pool }}"
+            driver: dir
+            description: SC-CLUSTER
+          register: sc_pool_again
+
+        - name: "SC-CLUSTER 16: run the network step again"
+          smcavoy.lxd.lxd_network:
+            name: "{{ net }}"
+            type: bridge
+            description: SC-CLUSTER
+            config:
+              ipv6.address: none
+          register: sc_net_again
+
+        - name: "SC-CLUSTER 17: run the group step again"
+          smcavoy.lxd.lxd_cluster_group:
+            name: "{{ group }}"
+            description: SC-CLUSTER
+            members: ["{{ lxd_members[2] }}"]
+          register: sc_group_again
+
+        - name: "SC-CLUSTER 18: run the container step again"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item.0 }}"
+            target: "{{ item.1 }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices: "{{ devices }}"
+          loop: "{{ names | zip(targets) | list }}"
+          register: sc_started_again
+
+        - name: "SC-CLUSTER 19: each container is on its target, member 2 moves its container away and back, and a second run makes no change"
+          vars:
+            mine: "{{ sc_after.instances | selectattr('name', 'in', names) | list }}"
+            located: "{{ dict(mine | map(attribute='name') | zip(mine | map(attribute='location'))) }}"
+          ansible.builtin.assert:
+            that:
+              - sc_members.members | length == 3
+              - sc_pool is changed
+              - sc_net is changed
+              - sc_started.results | map(attribute='instance') | map(attribute='location') | list == lxd_members
+              - sc_evacuate is changed
+              - sc_evacuated.members[0].status == 'Evacuated'
+              - sc_moved.instances[0].location != lxd_members[1]
+              - sc_moved.instances[0].state.status == 'Running'
+              - sc_marker.stdout == 'sc-cluster ' ~ lxd_run_id ~ '\n'
+              - sc_evacuate_again is not changed
+              - sc_restore is changed
+              - located[names[0]] == lxd_members[0]
+              - located[names[1]] == lxd_members[1]
+              - located[names[2]] == lxd_members[2]
+              - sc_pool_again is not changed
+              - sc_net_again is not changed
+              - sc_group_again is not changed
+              - sc_started_again.results | select('changed') | list == []
+              - sc_spread.results | map(attribute='instance') | map(attribute='location') | unique | list | length == 3
+      always:
+        - name: Restore member 2
+          smcavoy.lxd.lxd_cluster_member:
+            name: "{{ lxd_members[1] }}"
+            state: present
+          failed_when: false
+
+        - name: Remove the containers
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item }}"
+            state: absent
+            force: true
+          loop: "{{ names }}"
+          failed_when: false
+
+        - name: Remove the containers of the placement group
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item }}"
+            state: absent
+            force: true
+          loop: "{{ spread_names }}"
+          failed_when: false
+
+        - name: Remove the placement group
+          smcavoy.lxd.lxd_placement_group:
+            name: "{{ placement }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the group
+          smcavoy.lxd.lxd_cluster_group:
+            name: "{{ group }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the network
+          smcavoy.lxd.lxd_network:
+            name: "{{ net }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the pool
+          smcavoy.lxd.lxd_storage_pool:
+            name: "{{ pool }}"
+            state: absent
+          failed_when: false

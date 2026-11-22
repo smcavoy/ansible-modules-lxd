@@ -1,0 +1,343 @@
+# Goal: lxd_cluster_link makes pending, active, unidirectional, and public links between two clusters, updates them, and deletes them.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_link tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    on_a: "t-{{ lxd_run_id }}-to-b"
+    on_b: "t-{{ lxd_run_id }}-to-a"
+    peer:
+      url: "{{ lxd_peer_url }}"
+      server_cert: "{{ lxd_peer_server_cert }}"
+  block:
+    - name: "C1: check mode predicts a pending link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}"
+        description: link to A
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read B"
+      ansible.builtin.uri:
+        url: "{{ lxd_peer_url }}/1.0/cluster/links/{{ on_b }}"
+        ca_path: "{{ lxd_peer_server_cert }}"
+      register: c1_server
+
+    - name: "C2: make the pending link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}"
+        description: link to A
+      register: c2_result
+      no_log: true
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}"
+        description: link to A
+      register: c3_result
+
+    - name: "C1 to C3: check mode does nothing, the pending link has a token, and a second run makes no change and no token"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.trust_token | length > 0
+          - c2_result.pending is true
+          - c2_result.link.type == 'bidirectional'
+          - c3_result is not changed
+          - c3_result.trust_token is not defined
+          - c3_result.pending is true
+
+    - name: "CK1: activate the link on A with the token"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        trust_token: "{{ c2_result.trust_token }}"
+      register: ck1_result
+
+    - name: "CK1: run the activation again"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        trust_token: "{{ c2_result.trust_token }}"
+      register: ck1_again
+
+    - name: "CK1: read the link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}"
+      register: ck1_b
+
+    - name: "CK1: both sides are active, and a second activation makes no change"
+      ansible.builtin.assert:
+        that:
+          - ck1_result is changed
+          - ck1_result.pending is false
+          - ck1_result.trust_token is not defined
+          - ck1_again is not changed
+          - ck1_b is not changed
+          - ck1_b.pending is false
+          - ck1_b.link.description == 'link to A'
+
+    - name: "C4: check mode predicts a config and description update on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        description: link to B
+        config:
+          user.site: b
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5 and C6: update the config and the description on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        description: link to B
+        config:
+          user.site: b
+          user.extra: "1"
+      register: c6_result
+
+    - name: "C7: exact config removes user.extra and keeps the volatile keys"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        config:
+          user.site: b
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: run C7 again"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        config:
+          user.site: b
+        config_mode: exact
+      register: c8_result
+
+    - name: "C4 to C8: check mode, update, exact mode, and no change for a second run"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.description == 'link to B'
+          - c4_result.link.description == 'link to B'
+          - c6_result is changed
+          - c6_result.link.description == 'link to B'
+          - c6_result.link.config['user.extra'] == '1'
+          - c7_result is changed
+          - "'user.extra' not in c7_result.link.config"
+          - c7_result.link.config['volatile.addresses'] | length > 0
+          - c7_result.link.description == 'link to B'
+          - c8_result is not changed
+
+    - name: "B1: a config key that is not a user key"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        config:
+          volatile.addresses: 10.0.0.1:8443
+      register: b1_result
+      ignore_errors: true
+
+    - name: "B2: a token for a public link"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}-x"
+        type: public
+        trust_token: abc
+      register: b2_result
+      ignore_errors: true
+
+    - name: "B1 and B2: clear errors"
+      ansible.builtin.assert:
+        that:
+          - b1_result is failed
+          - "'not a user.* key' in b1_result.msg"
+          - b2_result is failed
+          - "'not for a public link' in b2_result.msg"
+
+    - name: "CK2: a pending unidirectional link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}-uni"
+        type: unidirectional
+      register: ck2_result
+      no_log: true
+
+    - name: "CK2: run it again"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}-uni"
+        type: unidirectional
+      register: ck2_again
+
+    - name: "CK2: revoke the pending unidirectional link"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}-uni"
+        state: absent
+      register: ck2_absent
+
+    - name: "CK2: revoke it again"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ on_b }}-uni"
+        state: absent
+      register: ck2_absent_again
+
+    - name: "CK2: the pending unidirectional link is only an identity on B, a second run makes no new token, and absent revokes it"
+      ansible.builtin.assert:
+        that:
+          - ck2_result is changed
+          - ck2_result.link is none
+          - ck2_result.pending is true
+          - ck2_result.trust_token | length > 0
+          - ck2_again is not changed
+          - ck2_again.trust_token is not defined
+          - ck2_absent is changed
+          - ck2_absent_again is not changed
+
+    - name: "Read the certificate fingerprint of B"
+      smcavoy.lxd.lxd_server_info:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+      register: info_b
+
+    - name: "CK4: a public link with a wrong fingerprint stops"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}-bad"
+        type: public
+        remote_address: "{{ lxd_peer_ip }}:8443"
+        fingerprint: "{{ '0' * 64 }}"
+      register: ck4_result
+      ignore_errors: true
+
+    - name: "CK4: a wrong fingerprint stops, and the link stays pending"
+      ansible.builtin.assert:
+        that:
+          - ck4_result is failed
+          - "'does not match' in ck4_result.msg"
+          - ck4_result.remote_fingerprint == info_b.server.environment.certificate_fingerprint
+          - ck4_result.link.config['volatile.pending_certificate'] | length > 0
+
+    - name: "CK4: delete the pending public link"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}-bad"
+        state: absent
+
+    - name: "Log the links on B before the delete on A"
+      ansible.builtin.uri:
+        url: "{{ lxd_peer_url }}/1.0/cluster/links?recursion=1"
+        ca_path: "{{ lxd_peer_server_cert }}"
+      register: links_b
+
+    - name: "Log the links on B"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT links-B {{ names | to_json }} {{ types | to_json }}"
+      vars:
+        names: "{{ links_b.json.metadata | map(attribute='name') | list }}"
+        types: "{{ links_b.json.metadata | map(attribute='type') | list }}"
+
+    - name: "C10: check mode predicts a delete on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the link on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read A"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/links/{{ on_a }}"
+        ca_path: "{{ lxd_server_cert }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.link is none
+          - c11_server.status == 404
+          - c12_result is not changed
+    - name: "CK3: a public link with the right fingerprint"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}-pub"
+        type: public
+        remote_address: "{{ lxd_peer_ip }}:8443"
+        fingerprint: "{{ info_b.server.environment.certificate_fingerprint }}"
+      register: ck3_result
+
+    - name: "CK3: run it again"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ on_a }}-pub"
+        type: public
+        remote_address: "{{ lxd_peer_ip }}:8443"
+        fingerprint: "{{ info_b.server.environment.certificate_fingerprint }}"
+      register: ck3_again
+
+    - name: "CK3: log the confirmed public link"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT public-confirmed {{ ck3_result.link | to_json }}"
+
+    - name: "CK3: the right fingerprint confirms the link, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - ck3_result is changed
+          - ck3_result.remote_fingerprint == info_b.server.environment.certificate_fingerprint
+          - ck3_result.pending is false
+          - ck3_result.link.type == 'public'
+          - ck3_again is not changed
+
+  always:
+    - name: Remove the links on A
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ on_a }}"
+        - "{{ on_a }}-pub"
+        - "{{ on_a }}-bad"
+      failed_when: false
+
+    - name: Remove the links on B
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ on_b }}"
+        - "{{ on_b }}-uni"
+      failed_when: false

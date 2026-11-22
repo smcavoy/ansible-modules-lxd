@@ -1,0 +1,83 @@
+# Goal: several writers that create the same project and profile at the same moment all succeed; none fails with "already exists".
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the create race tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    race: "t-{{ lxd_run_id }}-race"
+    rounds: [1, 2, 3, 4, 5]
+    writers: 4
+  block:
+    - name: Make a folder for the writer logs
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: race
+      register: race_dir
+
+    - name: Write the connection settings for the writers
+      ansible.builtin.copy:
+        dest: "{{ race_dir.path }}/vars.yml"
+        mode: "0600"
+        content: "{{ writer_vars | to_nice_yaml }}"
+      vars:
+        writer_vars:
+          lxd_url: "{{ lxd_url }}"
+          lxd_client_cert: "{{ lxd_client_cert }}"
+          lxd_client_key: "{{ lxd_client_key }}"
+          lxd_server_cert: "{{ lxd_server_cert }}"
+
+    - name: "RC1: start the writers of each round at the same moment"
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          failed=0
+          for round in {{ rounds | join(' ') }}; do
+            pids=""
+            for writer in $(seq 1 {{ writers }}); do
+              ansible-playbook -e "@{{ race_dir.path }}/vars.yml" -e "name={{ race }}-$round" {{ role_path }}/files/create.yml \
+                > "{{ race_dir.path }}/round$round-writer$writer.log" 2>&1 &
+              pids="$pids $!"
+            done
+            for pid in $pids; do wait "$pid" || failed=$((failed + 1)); done
+          done
+          echo "failed writers: $failed"
+          grep -h -o '"msg": "[^"]*"' {{ race_dir.path }}/*.log | sort | uniq -c || true
+          exit "$failed"
+        executable: /bin/bash
+      register: rc1_result
+      changed_when: true
+      failed_when: false
+
+    - name: "RC1: every writer succeeded"
+      ansible.builtin.assert:
+        that:
+          - rc1_result.rc == 0
+        fail_msg: "{{ rc1_result.stdout_lines }}"
+  always:
+    - name: Remove the race projects
+      smcavoy.lxd.lxd_project:
+        name: "{{ race }}-{{ item }}"
+        state: absent
+      loop: "{{ rounds }}"
+      failed_when: false
+
+    - name: Remove the race profiles
+      smcavoy.lxd.lxd_profile:
+        name: "{{ race }}-{{ item }}"
+        state: absent
+      loop: "{{ rounds }}"
+      failed_when: false
+
+    - name: Remove the writer logs
+      ansible.builtin.file:
+        path: "{{ race_dir.path }}"
+        state: absent
+      when: race_dir.path is defined

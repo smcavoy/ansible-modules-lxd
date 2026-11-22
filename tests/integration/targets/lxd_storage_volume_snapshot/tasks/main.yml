@@ -1,0 +1,284 @@
+# Goal: lxd_storage_volume_snapshot creates, updates, restores, and deletes volume snapshots, with check and diff mode.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_volume_snapshot tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    vol: "t-{{ lxd_run_id }}-vsvol"
+    ct: "t-{{ lxd_run_id }}-vsct"
+    snap_url: "{{ lxd_url }}/1.0/storage-pools/{{ lxd_pool }}/volumes/custom/{{ vol }}/snapshots/s1"
+  block:
+    - name: Create the volume
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+
+    - name: Start a container that uses the volume
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          data:
+            type: disk
+            pool: "{{ lxd_pool }}"
+            source: "{{ vol }}"
+            path: /data
+
+    - name: Write a marker file on the volume
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /data/marker
+        content: "before\n"
+
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ snap_url }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create the snapshot"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        description: test snapshot
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        description: test snapshot
+      register: c3_result
+
+    - name: "C2 and C3: the module creates the snapshot, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.snapshot.description == 'test snapshot'
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an expiry"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        expires_at: "2099-01-01T00:00:00Z"
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ snap_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the expiry, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.expires_at == '2099-01-01T00:00:00Z'
+          - c4_server.json.metadata.expires_at.startswith('0001-01-01')
+
+    - name: "C5: set the expiry"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        expires_at: "2099-01-01T00:00:00Z"
+      register: c5_result
+
+    - name: "VS3: clear the expiry"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        expires_at: ""
+      register: vs3_result
+
+    - name: "VS3: read the server"
+      ansible.builtin.uri:
+        url: "{{ snap_url }}"
+      register: vs3_server
+
+    - name: "C5 and VS3: the expiry is set, then cleared, and the description stays"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_result.snapshot.expires_at.startswith('2099-01-01')
+          - vs3_result is changed
+          - vs3_server.json.metadata.expires_at.startswith('0001-01-01')
+          - vs3_server.json.metadata.description == 'test snapshot'
+
+    - name: "C9: a bad expiry"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        expires_at: soon
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: a snapshot of a missing volume"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: no-such-volume
+        name: s1
+      register: c9_missing
+      ignore_errors: true
+
+    - name: "C9: a target on a standalone server"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        target: no-such-member
+        state: absent
+      register: c9_target
+      ignore_errors: true
+
+    - name: "C9: read the server"
+      ansible.builtin.uri:
+        url: "{{ snap_url }}"
+      register: c9_target_server
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'RFC 3339' in c9_result.msg"
+          - c9_missing is failed
+          - "'not found in pool' in c9_missing.msg"
+          - c9_target is failed
+          - "'only valid on a clustered server' in c9_target.msg"
+          - c9_target_server.status == 200
+
+    - name: "VS1: delete the marker file"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /data/marker
+        state: absent
+
+    # Most drivers cannot restore a volume that a running instance uses.
+    - name: "VS1: stop the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: stopped
+        force: true
+
+    - name: "VS1: restore the volume"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        state: restored
+      register: vs1_result
+
+    - name: "VS2: restore again"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        state: restored
+      register: vs2_result
+
+    - name: "VS1: start the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: started
+
+    - name: "VS1: read the marker file"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/instances/{{ ct }}/files?path=/data/marker"
+        return_content: true
+      register: vs1_file
+
+    - name: "VS1 and VS2: the restore brings back the file, and restored always reports a change"
+      ansible.builtin.assert:
+        that:
+          - vs1_result is changed
+          - vs2_result is changed
+          - vs1_file.status == 200
+          - vs1_file.content == 'before\n'
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the snapshot"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ snap_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_storage_volume_snapshot:
+        pool: "{{ lxd_pool }}"
+        volume: "{{ vol }}"
+        name: s1
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode keeps the snapshot, the delete removes it, and a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.snapshot is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false
+
+    - name: Remove the volume
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ vol }}"
+        state: absent
+      failed_when: false

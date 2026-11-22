@@ -1,0 +1,163 @@
+# Goal: SC-ACCESS gives a restricted TLS identity operator access to one project, and checks that it can work there and nowhere else.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-ACCESS restricted identity
+  hosts: localhost
+  gather_facts: false
+  vars:
+    acc_project: "t-{{ lxd_run_id }}-acc"
+    acc_group: "t-{{ lxd_run_id }}-acc-ops"
+    acc_identity: "t-{{ lxd_run_id }}-acc-user"
+    acc_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/sc-access-{{ lxd_run_id }}"
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-ACCESS 1: make a directory for the new client certificate"
+          ansible.builtin.file:
+            path: "{{ acc_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: "SC-ACCESS 2: make a client certificate for the restricted user"
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - req
+              - -x509
+              - -newkey
+              - ec
+              - -pkeyopt
+              - ec_paramgen_curve:secp384r1
+              - -nodes
+              - -keyout
+              - "{{ acc_dir }}/user.key"
+              - -out
+              - "{{ acc_dir }}/user.crt"
+              - -days
+              - "1"
+              - -subj
+              - /CN=sc-access
+              - -addext
+              - extendedKeyUsage=clientAuth
+            creates: "{{ acc_dir }}/user.crt"
+
+        - name: "SC-ACCESS 3: create the project"
+          smcavoy.lxd.lxd_project:
+            name: "{{ acc_project }}"
+            config:
+              features.images: false
+
+        - name: "SC-ACCESS 4: create a group with operator access to the project"
+          smcavoy.lxd.lxd_auth_group:
+            name: "{{ acc_group }}"
+            description: Operators of the SC-ACCESS project
+            permissions:
+              - entity_type: project
+                url: "/1.0/projects/{{ acc_project }}"
+                entitlement: operator
+          register: acc_group_result
+
+        - name: "SC-ACCESS 5: trust the user certificate in that group"
+          smcavoy.lxd.lxd_auth_identity:
+            type: tls
+            name: "{{ acc_identity }}"
+            certificate: "{{ lookup('ansible.builtin.file', acc_dir ~ '/user.crt') }}"
+            groups:
+              - "{{ acc_group }}"
+          register: acc_identity_result
+
+        - name: "SC-ACCESS 6: the group and the identity exist as asked"
+          ansible.builtin.assert:
+            that:
+              - acc_group_result is changed
+              - acc_identity_result is changed
+              - acc_identity_result.identity.groups == [acc_group]
+              - acc_group_result.auth_group.permissions | length == 1
+            fail_msg: "group={{ acc_group_result.auth_group }} identity={{ acc_identity_result.identity }}"
+
+        - name: "SC-ACCESS 7: the user creates a profile in its project"
+          smcavoy.lxd.lxd_profile:
+            name: user-profile
+            project: "{{ acc_project }}"
+            client_cert: "{{ acc_dir }}/user.crt"
+            client_key: "{{ acc_dir }}/user.key"
+            config:
+              limits.cpu: 1
+          register: acc_user_profile
+
+        - name: "SC-ACCESS 8: the user cannot create a profile in the default project"
+          smcavoy.lxd.lxd_profile:
+            name: "t-{{ lxd_run_id }}-not-allowed"
+            client_cert: "{{ acc_dir }}/user.crt"
+            client_key: "{{ acc_dir }}/user.key"
+          register: acc_user_default
+          ignore_errors: true
+
+        - name: "SC-ACCESS 9: the user cannot change the group"
+          smcavoy.lxd.lxd_auth_group:
+            name: "{{ acc_group }}"
+            client_cert: "{{ acc_dir }}/user.crt"
+            client_key: "{{ acc_dir }}/user.key"
+            permissions: []
+          register: acc_user_group
+          ignore_errors: true
+
+        - name: "SC-ACCESS 10: access works only where the group allows it"
+          ansible.builtin.assert:
+            that:
+              - acc_user_profile is changed
+              - acc_user_default is failed
+              - acc_user_group is failed
+            fail_msg: >-
+              own project: {{ acc_user_profile.msg | default('ok') }};
+              default project: {{ acc_user_default.msg | default('no failure') }};
+              group change: {{ acc_user_group.msg | default('no failure') }}
+
+        - name: "SC-ACCESS 11: a second run of the setup makes no change"
+          smcavoy.lxd.lxd_auth_identity:
+            type: tls
+            name: "{{ acc_identity }}"
+            certificate: "{{ lookup('ansible.builtin.file', acc_dir ~ '/user.crt') }}"
+            groups:
+              - "{{ acc_group }}"
+          register: acc_identity_again
+
+        - name: "SC-ACCESS 12: the second run is idempotent"
+          ansible.builtin.assert:
+            that:
+              - acc_identity_again is not changed
+            fail_msg: "{{ acc_identity_again.diff | default(acc_identity_again) | to_json }}"
+      always:
+        - name: Remove the identity
+          smcavoy.lxd.lxd_auth_identity:
+            type: tls
+            name: "{{ acc_identity }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the group
+          smcavoy.lxd.lxd_auth_group:
+            name: "{{ acc_group }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the project and its contents
+          smcavoy.lxd.lxd_project:
+            name: "{{ acc_project }}"
+            state: absent
+            force_delete: true
+          failed_when: false
+
+        - name: Remove the certificate files
+          ansible.builtin.file:
+            path: "{{ acc_dir }}"
+            state: absent

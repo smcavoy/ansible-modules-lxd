@@ -1,0 +1,53 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[collection_sources]
+"community.internal_test_tools" = "git+https://github.com/ansible-collections/community.internal_test_tools.git,main"
+
+[sessions]
+
+[sessions.lint]
+run_isort = false
+run_black = false
+run_flake8 = false
+run_pylint = false
+run_ruff_format = true
+run_ruff_check = true
+ruff_check_config = "ruff.toml"
+run_yamllint = true
+yamllint_config = ".yamllint"
+yamllint_config_plugins = ".yamllint-docs"
+yamllint_config_plugins_examples = ".yamllint-examples"
+run_mypy = true
+mypy_ansible_core_package = "ansible-core>=2.19.0"
+mypy_config = ".mypy.ini"
+
+[sessions.docs_check]
+validate_collection_refs = "all"
+
+[sessions.license_check]
+license_check_extra_ignore_paths = ["docs/design/**", "docs/design/specs/**", "changelogs/changelog.yaml", "CHANGELOG.md"]
+
+[sessions.extra_checks]
+run_no_unwanted_files = true
+no_unwanted_files_module_extensions = [".py"]
+no_unwanted_files_yaml_extensions = [".yml"]
+run_action_groups = true
+run_no_trailing_whitespace = true
+
+[[sessions.extra_checks.action_groups_config]]
+name = "lxd"
+pattern = "^lxd_.*$"
+exclusions = []
+doc_fragment = "smcavoy.lxd._attributes.action_group"
+
+[sessions.build_import_check]
+
+[sessions.ansible_test_sanity]
+include_devel = true
+min_version = "2.19"
+
+[sessions.ansible_test_units]
+include_devel = true
+min_version = "2.19"

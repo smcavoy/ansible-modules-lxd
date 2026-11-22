@@ -1,0 +1,186 @@
+# Goal: lxd_cluster_group creates, updates, and deletes cluster groups idempotently, and compares members as a set.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_group tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    grp: "t-{{ lxd_run_id }}-grp"
+    grp_url: "{{ lxd_url }}/1.0/cluster/groups/{{ grp }}"
+    grp_project: "t-{{ lxd_run_id }}-grp-p"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        members: ["{{ lxd_members[0] }}"]
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c1_server
+
+    - name: "C2: create the group with two members"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        description: test group
+        members: ["{{ lxd_members[0] }}", "{{ lxd_members[1] }}"]
+      register: c2_result
+
+    - name: "C3 and CG3: run C2 again with the members in another order"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        description: test group
+        members: ["{{ lxd_members[1] }}", "{{ lxd_members[0] }}"]
+      register: c3_result
+
+    - name: "C1 to C3: check mode, create, and no change for another order"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.group.members | sort == [lxd_members[0], lxd_members[1]] | sort
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts a member change"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        members: ["{{ lxd_members[2] }}"]
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c4_server
+
+    - name: "C5: add a member in merge mode"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        members: ["{{ lxd_members[2] }}"]
+        members_mode: merge
+      register: c5_result
+
+    - name: "C5: replace the members in exact mode"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        members: ["{{ lxd_members[2] }}"]
+      register: c5_exact
+
+    - name: "C4 and C5: the diff shows the change, merge adds, and exact replaces"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.members == [lxd_members[2]]
+          - c4_server.json.metadata.members | length == 2
+          - c5_result is changed
+          - c5_result.group.members | length == 3
+          - c5_exact is changed
+          - c5_exact.group.members == [lxd_members[2]]
+          - c5_exact.group.description == 'test group'
+
+    - name: "C9: delete the default group"
+      smcavoy.lxd.lxd_cluster_group:
+        name: default
+        state: absent
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: the default group cannot be deleted"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'cannot be deleted' in c9_result.msg"
+
+    - name: "CG4: make a project that uses the group"
+      smcavoy.lxd.lxd_project:
+        name: "{{ grp_project }}"
+        config:
+          restricted: true
+          restricted.cluster.groups: "{{ grp }}"
+
+    - name: "CG4: delete the group that is in use"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      register: cg4_result
+      ignore_errors: true
+
+    - name: "CG4: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: cg4_server
+
+    - name: "CG4: remove the project"
+      smcavoy.lxd.lxd_project:
+        name: "{{ grp_project }}"
+        state: absent
+
+    - name: "CG4: a group in use fails the delete, and the group keeps its members"
+      ansible.builtin.assert:
+        that:
+          - cg4_result is failed
+          - "'is in use' in cg4_result.msg"
+          - "('/1.0/projects/' ~ grp_project) in cg4_result.msg"
+          - cg4_server.json.metadata.members == [lxd_members[2]]
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11 and CG2: delete the group with a member"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ grp_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete with a member, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.group is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the test project
+      smcavoy.lxd.lxd_project:
+        name: "{{ grp_project }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the test group
+      smcavoy.lxd.lxd_cluster_group:
+        name: "{{ grp }}"
+        state: absent
+      failed_when: false

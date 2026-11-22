@@ -1,0 +1,101 @@
+# Goal: lxd_storage_volume_info lists volumes in a pool or all pools, reads one, filters by type and content type.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_volume_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: Create a test volume
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ run }}-vol"
+
+    - name: Create a stopped container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ run }}-volct"
+        state: stopped
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_storage_volume_info:
+        pool: "{{ lxd_pool }}"
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_storage_volume_info:
+        pool: "{{ lxd_pool }}"
+        name: "{{ run }}-vol"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_storage_volume_info:
+        pool: "{{ lxd_pool }}"
+        name: no-such-volume
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_storage_volume_info:
+        pool: "{{ lxd_pool }}"
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: the list holds the test object, one by name works, a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - (run ~ "-vol") in (i1_result.storage_volumes | map(attribute='name') | list)
+          - i2_result.storage_volumes | length == 1
+          - i2_result.storage_volumes[0].name == (run ~ "-vol")
+          - i3_result is not changed
+          - i3_result.storage_volumes == []
+          - i4_result is not changed
+          - i4_result.storage_volumes | length == i1_result.storage_volumes | length
+
+    - name: "VI1: list the container volumes"
+      smcavoy.lxd.lxd_storage_volume_info:
+        pool: "{{ lxd_pool }}"
+        type: container
+      register: vi1_result
+
+    - name: "VI2: filter by content type"
+      smcavoy.lxd.lxd_storage_volume_info:
+        filter: content_type eq block
+      register: vi2_result
+
+    - name: "VI3: read all pools with the state"
+      smcavoy.lxd.lxd_storage_volume_info:
+        include_state: true
+      register: vi3_result
+
+    - name: "VI1 to VI3: the type and the filter limit the list, and all pools hold the test volume"
+      ansible.builtin.assert:
+        that:
+          - (run ~ '-volct') in (vi1_result.storage_volumes | map(attribute='name') | list)
+          - vi1_result.storage_volumes | map(attribute='type') | unique | list == ['container']
+          - vi2_result.storage_volumes | rejectattr('content_type', 'eq', 'block') | list == []
+          - (run ~ '-vol') in (vi3_result.storage_volumes | map(attribute='name') | list)
+          - vi3_result.storage_volumes | selectattr('name', 'eq', run ~ '-vol') | map(attribute='state') | first is mapping
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ run }}-volct"
+        state: absent
+        force: true
+      failed_when: false
+
+    - name: Remove the test volume
+      smcavoy.lxd.lxd_storage_volume:
+        pool: "{{ lxd_pool }}"
+        name: "{{ run }}-vol"
+        state: absent
+      failed_when: false

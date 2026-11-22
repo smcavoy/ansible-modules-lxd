@@ -1,0 +1,358 @@
+# Goal: lxd_instance creates, configures, starts, stops, freezes, and deletes a container idempotently, with check and diff mode.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    inst: "t-{{ lxd_run_id }}-ct"
+    inst_url: "{{ lxd_url }}/1.0/instances/t-{{ lxd_run_id }}-ct"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          limits.cpu: 1
+      check_mode: true
+      register: c1_result
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+      register: c1_server
+    - name: "C1: nothing exists yet"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create and start the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          limits.cpu: 1
+        wait_for:
+          - type: ipv4
+      register: c2_result
+    - name: "C2 and IN4: the container runs and has an address"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.instance.status == 'Running'
+          - c2_result.instance.config['limits.cpu'] == '1'
+          - c2_result.addresses.values() | flatten | select('match', '^[0-9.]+$') | list | length >= 1
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          limits.cpu: 1
+      register: c3_result
+    - name: "C3: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        config:
+          limits.cpu: 2
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+      register: c4_server
+    - name: "C4: the diff shows the key, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.config['limits.cpu'] == '2'
+          - c4_server.json.metadata.config['limits.cpu'] == '1'
+
+    - name: "C5: update a key on the running container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        config:
+          limits.cpu: 2
+      register: c5_result
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+      register: c5_server
+    - name: "C5: the server has the new value"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config['limits.cpu'] == '2'
+
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+        method: PATCH
+        body:
+          config:
+            user.other: set-by-api
+    - name: "C6: run without the key"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        config:
+          limits.cpu: 2
+      register: c6_result
+    - name: "C6: merge keeps the key"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_result.instance.config['user.other'] == 'set-by-api'
+
+    - name: "C7: config_mode exact"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        config:
+          limits.cpu: 2
+        config_mode: exact
+      register: c7_result
+    - name: "C7: exact removes the unmanaged key and keeps volatile and image keys"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_result.instance.config"
+          - c7_result.instance.config.keys() | select('match', '^volatile\\.') | list | length > 0
+
+    - name: "C8: remove a key with null"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        config:
+          limits.cpu: null
+      register: c8_result
+    - name: "C8: the key is gone"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'limits.cpu' not in c8_result.instance.config"
+
+    - name: "C9: a create without a source"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}-nosource"
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'source is required' in c9_result.msg"
+
+    - name: "IN1: stop the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: stopped
+      register: in1_result
+    - name: "IN9: present keeps the run state"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: present
+      register: in9_result
+    - name: "IN1 and IN9: stopped, and present makes no change"
+      ansible.builtin.assert:
+        that:
+          - in1_result is changed
+          - in1_result.instance.status == 'Stopped'
+          - in9_result is not changed
+          - in9_result.instance.status == 'Stopped'
+
+    - name: "IN2: freeze the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: frozen
+      register: in2_frozen
+    - name: "IN2: start thaws it"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: started
+      register: in2_started
+    - name: "IN2: frozen, then running"
+      ansible.builtin.assert:
+        that:
+          - in2_frozen.instance.status == 'Frozen'
+          - in2_started is changed
+          - in2_started.instance.status == 'Running'
+
+    - name: "IN3: restart twice"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: restarted
+      register: in3_result
+      loop: [1, 2]
+    - name: "IN3: restarted always reports a change"
+      ansible.builtin.assert:
+        that:
+          - in3_result.results | map(attribute='changed') | list == [true, true]
+
+    - name: "IN4: freeze the container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: frozen
+    - name: "IN4: read the state of the frozen container"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}/state"
+      register: in4_before
+      # A read just after a state change can meet a connection reset on the CI host (full runs 338 and 339).
+      retries: 3
+      delay: 2
+      until: in4_before is not failed
+    - name: "IN4: restart the frozen container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: restarted
+      register: in4_result
+    - name: "IN4: read the state after the restart"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}/state"
+      register: in4_after
+      # A read just after a state change can meet a connection reset on the CI host (full runs 338 and 339).
+      retries: 3
+      delay: 2
+      until: in4_after is not failed
+    - name: "IN4: restarted on a frozen container gives a new, running container"
+      ansible.builtin.assert:
+        that:
+          - in4_before.json.metadata.status == 'Frozen'
+          - in4_result is changed
+          - in4_result.instance.status == 'Running'
+          - in4_after.json.metadata.status == 'Running'
+          - in4_after.json.metadata.pid != in4_before.json.metadata.pid
+
+    - name: "IN5: profiles set to an empty list"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        profiles: []
+        devices:
+          root:
+            type: disk
+            pool: "{{ lxd_pool }}"
+            path: /
+          eth0:
+            type: nic
+            network: lxdbr0
+            name: eth0
+      register: in5_result
+    - name: "IN5: the container has no profiles"
+      ansible.builtin.assert:
+        that:
+          - in5_result is changed
+          - in5_result.instance.profiles == []
+
+    - name: "IN6: devices_mode exact with the same devices"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        devices:
+          root:
+            type: disk
+            pool: "{{ lxd_pool }}"
+            path: /
+          eth0:
+            type: nic
+            network: lxdbr0
+            name: eth0
+        devices_mode: exact
+      register: in6_result
+    - name: "IN6: no change"
+      ansible.builtin.assert:
+        that:
+          - in6_result is not changed
+
+    - name: "R10: a different type on an existing container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        type: virtual-machine
+      register: r10_result
+    - name: "R10: a warning and no change"
+      ansible.builtin.assert:
+        that:
+          - r10_result is not changed
+          - r10_result.warnings | select('search', 'type applies only on create') | list | length == 1
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: absent
+        force: true
+      check_mode: true
+      register: c10_result
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+      register: c10_server
+    - name: "C10: the container still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11 and IN8: force deletes a running container in one call"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: absent
+        force: true
+      register: c11_result
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+      register: c11_server
+    - name: "C11: the container is gone"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: absent
+      register: c12_result
+    - name: "C12: no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+
+    # A wrong project name must not look like "already absent".
+    - name: "C13: delete in a project that does not exist"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        project: "t-{{ lxd_run_id }}-no-such-project"
+        state: absent
+      register: c13_result
+      ignore_errors: true
+    - name: "C13: the task fails and names the project"
+      ansible.builtin.assert:
+        that:
+          - c13_result is failed
+          - "'does not exist' in c13_result.msg"
+          - "'no-such-project' in c13_result.msg"
+  always:
+    - name: Remove the test container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ inst }}"
+        state: absent
+        force: true
+      failed_when: false

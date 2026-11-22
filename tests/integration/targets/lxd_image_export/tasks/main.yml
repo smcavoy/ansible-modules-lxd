@@ -1,0 +1,195 @@
+# Goal: lxd_image_export downloads a split image, skips matching files, downloads again for a changed file, and the files import again.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_image_export tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+  vars:
+    proj: "t-{{ lxd_run_id }}-imgexp"
+  block:
+    - name: Make a folder for the files
+      ansible.builtin.tempfile:
+        state: directory
+      register: dest
+
+    - name: "EX0: check mode predicts a download"
+      smcavoy.lxd.lxd_image_export:
+        alias: "{{ lxd_image_ct }}"
+        dest_dir: "{{ dest.path }}"
+      check_mode: true
+      register: ex0_result
+
+    - name: "EX1: export the split test image"
+      smcavoy.lxd.lxd_image_export:
+        alias: "{{ lxd_image_ct }}"
+        dest_dir: "{{ dest.path }}"
+      register: ex1_result
+
+    - name: "EX1: find the files"
+      ansible.builtin.find:
+        paths: "{{ dest.path }}"
+        hidden: true
+      register: ex1_files
+
+    # Independent reads: the alias and the image over the REST API, and the files with sha256sum and stat on the controller.
+    # The fingerprint of a split image is the SHA-256 of the metadata file and the rootfs file, one after the other.
+    - name: "EX1: read the aliases from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/aliases?recursion=1"
+        status_code: 200
+      register: ex1_aliases
+      retries: 3
+      delay: 2
+      until: ex1_aliases is not failed
+
+    - name: "EX1: read the image from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ ex1_result.fingerprint }}"
+        status_code: 200
+      register: ex1_server
+      retries: 3
+      delay: 2
+      until: ex1_server is not failed
+
+    - name: "EX1: the checksum of the exported files, metadata first"
+      ansible.builtin.shell:
+        cmd: "cat {{ ex1_result.files | map('quote') | join(' ') }} | sha256sum | cut -d' ' -f1"
+      changed_when: false
+      register: ex1_sum
+
+    - name: "EX1: the sizes of the exported files"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop: "{{ ex1_result.files }}"
+      register: ex1_stat
+
+    - name: "EX1: the files on the controller are the image that the server has under the alias"
+      ansible.builtin.assert:
+        that:
+          - ex1_aliases.json.metadata | selectattr('name', 'eq', lxd_image_ct) | map(attribute='target') | list == [ex1_result.fingerprint]
+          - ex1_server.json.metadata.fingerprint == ex1_result.fingerprint
+          - ex1_sum.stdout == ex1_server.json.metadata.fingerprint
+          - ex1_stat.results | map(attribute='stat.size') | sum == ex1_server.json.metadata.size
+          - ex1_stat.results | map(attribute='stat.size') | min > 0
+
+    - name: "EX2: run EX1 again, by fingerprint prefix"
+      smcavoy.lxd.lxd_image_export:
+        fingerprint: "{{ ex1_result.fingerprint[:12] }}"
+        dest_dir: "{{ dest.path }}"
+      register: ex2_result
+
+    - name: "EX3: change the rootfs file"
+      ansible.builtin.shell:
+        cmd: "printf x >> '{{ ex1_result.files[1] }}'"
+      changed_when: true
+
+    - name: "EX3: export again"
+      smcavoy.lxd.lxd_image_export:
+        alias: "{{ lxd_image_ct }}"
+        dest_dir: "{{ dest.path }}"
+      register: ex3_result
+
+    - name: "EX3: run it again"
+      smcavoy.lxd.lxd_image_export:
+        alias: "{{ lxd_image_ct }}"
+        dest_dir: "{{ dest.path }}"
+      register: ex3_again
+
+    - name: "EX3: the checksum of the files after the new download"
+      ansible.builtin.shell:
+        cmd: "cat {{ ex3_result.files | map('quote') | join(' ') }} | sha256sum | cut -d' ' -f1"
+      changed_when: false
+      register: ex3_sum
+
+    - name: "EX3: the new download repairs the changed file"
+      ansible.builtin.assert:
+        that:
+          - ex3_sum.stdout == ex1_server.json.metadata.fingerprint
+
+    - name: "EX4: import the files into a project with its own image store"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config:
+          features.images: true
+
+    - name: "EX4: upload the exported files"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        fingerprint: "{{ ex1_result.fingerprint }}"
+        source:
+          metadata_path: "{{ ex1_result.files[0] }}"
+          rootfs_path: "{{ ex1_result.files[1] }}"
+      register: ex4_result
+
+    - name: "EX4: read the imported image from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ ex1_result.fingerprint }}?project={{ proj }}"
+        status_code: 200
+      register: ex4_server
+      retries: 3
+      delay: 2
+      until: ex4_server is not failed
+
+    - name: "EX4: the server computes the same fingerprint and size from the exported files"
+      ansible.builtin.assert:
+        that:
+          - ex4_server.json.metadata.fingerprint == ex1_server.json.metadata.fingerprint
+          - ex4_server.json.metadata.size == ex1_server.json.metadata.size
+
+    - name: "B1: a missing folder"
+      smcavoy.lxd.lxd_image_export:
+        alias: "{{ lxd_image_ct }}"
+        dest_dir: "{{ dest.path }}/no-such-dir"
+      register: b1_result
+      ignore_errors: true
+
+    - name: "EX0 to EX4 and B1: two files, no change on a second run, a new download for a changed file, and the same fingerprint after an import"
+      ansible.builtin.assert:
+        that:
+          - ex0_result is changed
+          - ex0_result.files == []
+          - ex1_result is changed
+          - ex1_result.files | length == 2
+          - ex1_result.files[0] | basename is match('meta-' ~ ex1_result.fingerprint)
+          - ex1_files.files | length == 2
+          - ex2_result is not changed
+          - ex2_result.files == ex1_result.files
+          - ex3_result is changed
+          - ex3_again is not changed
+          - ex4_result is changed
+          - ex4_result.image.fingerprint == ex1_result.fingerprint
+          - b1_result is failed
+          - "'dest_dir does not exist' in b1_result.msg"
+  always:
+    - name: Remove the image from the project
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        fingerprint: "{{ ex1_result.fingerprint }}"
+        state: absent
+      when: ex1_result.fingerprint is defined
+      failed_when: false
+
+    - name: Remove the project
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the folder
+      ansible.builtin.file:
+        path: "{{ dest.path }}"
+        state: absent
+      when: dest.path is defined

@@ -1,0 +1,17 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=Set up LXD in a test sandbox on first boot
+After=snap.lxd.daemon.unix.socket snap.lxd.daemon.socket network-online.target lxd-agent.service
+Wants=network-online.target
+ConditionPathExists=!/var/lib/lxd-sandbox/done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lxd-sandbox-init
+
+[Install]
+WantedBy=multi-user.target

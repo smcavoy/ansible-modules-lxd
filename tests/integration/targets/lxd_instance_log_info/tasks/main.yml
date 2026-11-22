@@ -1,0 +1,73 @@
+# Goal: lxd_instance_log_info lists the log files of an instance, reads one, cuts it with tail, and gives an empty result for a missing file.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_log_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-logs"
+  block:
+    - name: Start a container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        state: started
+
+    - name: "I1: list the log files"
+      smcavoy.lxd.lxd_instance_log_info:
+        instance: "{{ ct }}"
+      register: i1_result
+
+    - name: "I2: read lxc.conf"
+      smcavoy.lxd.lxd_instance_log_info:
+        instance: "{{ ct }}"
+        filename: lxc.conf
+      register: i2_result
+
+    - name: "I3: a log file that a container does not have"
+      smcavoy.lxd.lxd_instance_log_info:
+        instance: "{{ ct }}"
+        filename: qemu.conf
+      register: i3_result
+
+    - name: "I4 and LG1: the last 5 lines of lxc.conf in check mode"
+      smcavoy.lxd.lxd_instance_log_info:
+        instance: "{{ ct }}"
+        filename: lxc.conf
+        tail: 5
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: log the result"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT logs {{ i1_result.logs | to_json }} i3-content={{ i3_result.content | default('none') | to_json }}"
+
+    - name: "I1 to I4 and LG1: the list, one file, an empty missing file, and at most 5 lines"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - "'lxc.log' in i1_result.logs"
+          - "'lxc.conf' in i1_result.logs"
+          - i2_result.content | length > 0
+          - i2_result.lines | length > 0
+          - i3_result is not failed
+          - i3_result.content == ''
+          - i3_result.lines == []
+          - i4_result is not changed
+          - i4_result.lines | length <= 5
+          - i4_result.lines | length > 0
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

@@ -1,0 +1,251 @@
+# Goal: lxd_replicator_run copies a running instance to the standby project on the other cluster, and check mode starts no run.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_replicator_run tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    link_a: "t-{{ lxd_run_id }}-rra"
+    link_b: "t-{{ lxd_run_id }}-rrb"
+    proj: "t-{{ lxd_run_id }}-rr"
+    rep: web-dr
+    ct: "t-{{ lxd_run_id }}-rrct"
+    peer:
+      url: "{{ lxd_peer_url }}"
+      server_cert: "{{ lxd_peer_server_cert }}"
+    link_group: "t-{{ lxd_run_id }}-links"
+    link_permissions:
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: operator
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: can_edit
+    features:
+      features.images: "false"
+      features.profiles: "false"
+      features.storage.volumes: "false"
+      features.storage.buckets: "false"
+  block:
+    - name: "create the project on A"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config: "{{ features }}"
+
+    - name: "create the project on B"
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        config: "{{ features }}"
+
+    - name: "let the cluster links work on the project of A"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ link_group }}"
+        permissions: "{{ link_permissions }}"
+
+    - name: "let the cluster links work on the project of B"
+      smcavoy.lxd.lxd_auth_group:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_group }}"
+        permissions: "{{ link_permissions }}"
+
+    - name: "make a pending link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_b }}"
+        auth_groups: ["{{ link_group }}"]
+      register: pending
+      no_log: true
+
+    - name: "activate the link on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ link_a }}"
+        trust_token: "{{ pending.trust_token }}"
+        auth_groups: ["{{ link_group }}"]
+      no_log: true
+
+    - name: "point the project on A at B"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config:
+          replica.cluster: "{{ link_a }}"
+
+    - name: "point the project on B at A, in standby mode"
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        config:
+          replica.cluster: "{{ link_b }}"
+        replica_mode: standby
+
+    - name: Create the replicator
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        config:
+          cluster: "{{ link_a }}"
+
+    - name: Promote the project on A to leader
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        replica_mode: leader
+
+    - name: Start a container in the project on A
+      smcavoy.lxd.lxd_instance:
+        project: "{{ proj }}"
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        wait_for:
+          - type: ipv4
+
+    - name: Write a marker into the container
+      smcavoy.lxd.lxd_instance_exec:
+        project: "{{ proj }}"
+        instance: "{{ ct }}"
+        command: [sh, -c, "echo rr1 {{ lxd_run_id }} > /root/marker && sync"]
+
+    - name: "RR3: run the replicator in check mode"
+      smcavoy.lxd.lxd_replicator_run:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+      check_mode: true
+      register: rr3_result
+
+    - name: "RR3: read the replicator"
+      smcavoy.lxd.lxd_replicator_info:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        include_state: true
+      register: rr3_info
+
+    - name: "RR1: run the replicator"
+      smcavoy.lxd.lxd_replicator_run:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+      register: rr1_result
+
+    - name: "RR1: read the replicator"
+      smcavoy.lxd.lxd_replicator_info:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        include_state: true
+      register: rr1_info
+
+    - name: "RR1: read the copy on B"
+      smcavoy.lxd.lxd_instance_info:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        project: "{{ proj }}"
+        name: "{{ ct }}"
+      register: rr1_copy
+
+    - name: "RR1: run the replicator again, for a refresh"
+      smcavoy.lxd.lxd_replicator_run:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+      register: rr1_again
+
+    - name: "RR1 and RR3: log the facts"
+      ansible.builtin.debug:
+        msg: >-
+          LXDTEST-FACT replicator-run rr3={{ rr3_info.replicators[0] | to_json }} rr1={{ rr1_info.replicators[0] | to_json }}
+          copy={{ (rr1_copy.instances[0] | default({})) | dict2items
+          | rejectattr('key', 'in', ['state', 'expanded_config', 'expanded_devices']) | items2dict | to_json }}
+
+    - name: "RR1 and RR3: check mode starts no run, a run copies the container, and a second run works too"
+      ansible.builtin.assert:
+        that:
+          - rr3_result is changed
+          - rr3_result.operation is not defined
+          - rr3_info.replicators[0].state.status == 'Pending'
+          - rr1_result is changed
+          - rr1_result.status == 'Completed'
+          - rr1_result.operation | length > 0
+          - rr1_info.replicators[0].last_run_status == 'Completed'
+          - rr1_copy.instances | length == 1
+          - rr1_copy.instances[0].status == 'Stopped'
+          - rr1_again is changed
+          - rr1_again.status == 'Completed'
+
+  always:
+    - name: Clear the replica modes
+      smcavoy.lxd.lxd_project:
+        url: "{{ item }}"
+        server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+        name: "{{ proj }}"
+        replica_mode: ""
+      loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+      failed_when: false
+
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        url: "{{ item }}"
+        server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+        project: "{{ proj }}"
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+      failed_when: false
+
+    - name: Remove the replicator
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the projects
+      smcavoy.lxd.lxd_project:
+        url: "{{ item }}"
+        server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+        name: "{{ proj }}"
+        state: absent
+      loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+      failed_when: false
+
+    - name: Remove the link on A
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ link_a }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the link on B
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_b }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the auth group on A
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ link_group }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the auth group on B
+      smcavoy.lxd.lxd_auth_group:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_group }}"
+        state: absent
+      failed_when: false

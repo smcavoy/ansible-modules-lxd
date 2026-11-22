@@ -1,0 +1,148 @@
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# The web stack, as a user writes it. SC-WEB runs it once. SC-IDEMP runs it twice.
+# Every task registers its result into web_results, so that a caller can check the changed flags.
+
+- name: Create the web project
+  smcavoy.lxd.lxd_project:
+    name: "{{ web_project }}"
+    description: SC-WEB project
+    config:
+      features.images: false
+      features.profiles: true
+      features.storage.volumes: true
+      features.networks: false
+  register: web_project_result
+
+- name: Create the web bridge
+  smcavoy.lxd.lxd_network:
+    name: "{{ web_bridge }}"
+    config:
+      ipv4.address: "{{ web_subnet }}.1/24"
+      ipv4.nat: true
+      ipv6.address: none
+  register: web_bridge_result
+
+- name: Create the web profile
+  smcavoy.lxd.lxd_profile:
+    name: web
+    project: "{{ web_project }}"
+    config:
+      limits.cpu: 1
+      limits.memory: 256MiB
+    devices:
+      root:
+        type: disk
+        pool: "{{ lxd_pool }}"
+        path: /
+      eth0:
+        type: nic
+        network: "{{ web_bridge }}"
+        name: eth0
+  register: web_profile_result
+
+- name: Create the content volume
+  smcavoy.lxd.lxd_storage_volume:
+    pool: "{{ lxd_pool }}"
+    name: www
+    project: "{{ web_project }}"
+    description: Web content
+  register: web_volume_result
+
+- name: Run the web container
+  smcavoy.lxd.lxd_instance:
+    name: web1
+    project: "{{ web_project }}"
+    source:
+      image: "{{ lxd_image_ct }}"
+    profiles:
+      - web
+    devices:
+      www:
+        type: disk
+        pool: "{{ lxd_pool }}"
+        source: www
+        path: /srv/www
+    state: started
+    wait_for:
+      - type: ipv4
+        nic: eth0
+  register: web_instance_result
+
+- name: Write the web page
+  smcavoy.lxd.lxd_instance_file:
+    instance: web1
+    project: "{{ web_project }}"
+    path: /srv/www/index.html
+    content: "SC-WEB {{ lxd_run_id }}\n"
+  register: web_page_result
+
+- name: Write the start script of the web server
+  smcavoy.lxd.lxd_instance_file:
+    instance: web1
+    project: "{{ web_project }}"
+    path: /etc/local.d/web.start
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Serve /srv/www/index.html on port 80 with the busybox nc applet.
+      (
+        while true; do
+          body="$(cat /srv/www/index.html)"
+          length="$(printf '%s' "$body" | wc -c)"
+          printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+            "$length" "$body" | nc -l -p 80
+        done
+      ) >/dev/null 2>&1 &
+  register: web_script_result
+
+- name: Enable the OpenRC local service
+  smcavoy.lxd.lxd_instance_file:
+    instance: web1
+    project: "{{ web_project }}"
+    path: /etc/runlevels/default/local
+    type: link
+    link_target: /etc/init.d/local
+  register: web_service_result
+
+- name: Restart the container when its start files changed
+  smcavoy.lxd.lxd_instance:
+    name: web1
+    project: "{{ web_project }}"
+    state: restarted
+    wait_for:
+      - type: ipv4
+        nic: eth0
+  register: web_restart_result
+  when: web_script_result is changed or web_service_result is changed
+
+- name: Forward port 8080 of the sandbox to the container
+  smcavoy.lxd.lxd_network_forward:
+    network: "{{ web_bridge }}"
+    listen_address: "{{ lxd_sandbox_ip }}"
+    description: SC-WEB forward
+    ports:
+      - protocol: tcp
+        listen_port: "8080"
+        target_address: "{{ web_instance_result.addresses.eth0 | first }}"
+        target_port: "80"
+  register: web_forward_result
+
+- name: Collect the results of this pass
+  ansible.builtin.set_fact:
+    web_results: "{{ (web_results | default([])) + [this_pass] }}"
+  vars:
+    this_pass:
+      project: "{{ web_project_result.changed }}"
+      bridge: "{{ web_bridge_result.changed }}"
+      profile: "{{ web_profile_result.changed }}"
+      volume: "{{ web_volume_result.changed }}"
+      instance: "{{ web_instance_result.changed }}"
+      page: "{{ web_page_result.changed }}"
+      script: "{{ web_script_result.changed }}"
+      service: "{{ web_service_result.changed }}"
+      restart: "{{ web_restart_result.changed | default(false) }}"
+      forward: "{{ web_forward_result.changed }}"

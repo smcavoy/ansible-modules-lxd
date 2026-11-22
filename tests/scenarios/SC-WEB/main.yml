@@ -1,0 +1,56 @@
+# Goal: SC-WEB builds a web stack with a project, bridge, profile, volume, container, file, and forward, and serves a page through the forward.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-WEB web stack
+  hosts: localhost
+  gather_facts: false
+  vars:
+    web_project: "t-{{ lxd_run_id }}-web"
+    web_bridge: "tb{{ lxd_run_id }}w"
+    web_subnet: "10.{{ 150 + (lxd_slot | int) }}.0"
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-WEB 1: build the stack"
+          ansible.builtin.include_tasks: apply.yml
+
+        - name: "SC-WEB 2: every first-run task reports a change"
+          ansible.builtin.assert:
+            that:
+              - web_results[0].project | bool
+              - web_results[0].bridge | bool
+              - web_results[0].profile | bool
+              - web_results[0].volume | bool
+              - web_results[0].instance | bool
+              - web_results[0].page | bool
+              - web_results[0].forward | bool
+            fail_msg: "Expected a change on each first-run task. Got {{ web_results[0] }}"
+
+        - name: "SC-WEB 3: a request through the forward gets the page"
+          ansible.builtin.uri:
+            url: "http://{{ lxd_sandbox_ip }}:8080/"
+            return_content: true
+            timeout: 5
+          register: web_page_check
+          until: web_page_check.status == 200 and ('SC-WEB ' ~ lxd_run_id) in web_page_check.content
+          retries: 20
+          delay: 3
+
+        - name: "SC-WEB 4: the container uses the volume"
+          ansible.builtin.assert:
+            that:
+              - web_instance_result.instance.devices.www.source == 'www'
+              - web_instance_result.instance.status == 'Running'
+            fail_msg: "Unexpected instance: {{ web_instance_result.instance }}"
+      always:
+        - name: Remove all scenario resources
+          ansible.builtin.include_tasks: cleanup.yml

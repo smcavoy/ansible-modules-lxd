@@ -1,0 +1,287 @@
+# Goal: lxd_network_load_balancer creates, updates, and deletes OVN load balancers idempotently, and traffic reaches both backends.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_load_balancer tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    net: "t{{ lxd_run_id }}lb"
+    vip: 10.250.200.10
+    lb_url: "{{ lxd_url }}/1.0/networks/{{ net }}/load-balancers/{{ vip }}"
+    names:
+      - "t-{{ lxd_run_id }}-lb1"
+      - "t-{{ lxd_run_id }}-lb2"
+      - "t-{{ lxd_run_id }}-lbc"
+  block:
+    - name: Allow listen addresses on the uplink
+      smcavoy.lxd.lxd_network:
+        name: "{{ lxd_ovn_uplink }}"
+        config:
+          ipv4.routes: 10.250.200.0/24
+
+    - name: Create the OVN network
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        type: ovn
+        config:
+          network: "{{ lxd_ovn_uplink }}"
+
+    - name: Start two backends and a client on the OVN network
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          eth0:
+            type: nic
+            network: "{{ net }}"
+            name: eth0
+        wait_for:
+          - type: ipv4
+        wait_timeout: 240
+      loop: "{{ names }}"
+      register: started
+
+    - name: Start a server that answers with its name in each backend
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ item }}"
+        command:
+          - sh
+          - -c
+          - >-
+            (while true; do printf 'HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{{ item[-3:] }}\n' | nc -l -p 80; done)
+            >/dev/null 2>&1 &
+      loop: "{{ names[:2] }}"
+
+    - name: Collect the backend addresses
+      ansible.builtin.set_fact:
+        backends:
+          - name: web1
+            target_address: "{{ started.results[0].addresses.eth0 | select('match', '^[0-9.]+$') | first }}"
+            target_port: "80"
+          - name: web2
+            target_address: "{{ started.results[1].addresses.eth0 | select('match', '^[0-9.]+$') | first }}"
+            target_port: "80"
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_backend: [web1, web2]
+
+    - name: "C1: check mode predicts a load balancer"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        backends: "{{ backends }}"
+        ports: "{{ ports }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ lb_url }}"
+      register: c1_server
+
+    - name: "C2: create the load balancer"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        description: web
+        backends: "{{ backends }}"
+        ports: "{{ ports }}"
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        description: web
+        backends: "{{ backends }}"
+        ports: "{{ ports }}"
+      register: c3_result
+
+    - name: "LB2: backends and backend names in another order"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        backends: "{{ backends | reverse | list }}"
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_backend: [web2, web1]
+      register: lb2_result
+
+    - name: "C1 to C3 and LB2: check mode does nothing, the load balancer exists, and a second run or a new order makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.load_balancer.backends | length == 2
+          - c2_result.load_balancer.description == 'web'
+          - c3_result is not changed
+          - lb2_result is not changed
+
+    - name: "LB1: ask the load balancer ten times from the client"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ names[2] }}"
+        command:
+          - sh
+          - -c
+          - "for i in 1 2 3 4 5 6 7 8 9 10; do wget -q -T 3 -O- http://{{ vip }}/ || echo none; done"
+      register: lb1_result
+
+    - name: "LB1: log the answers"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT lb-answers {{ lb1_result.stdout_lines | to_json }}"
+
+    - name: "LB1: both backends answer"
+      ansible.builtin.assert:
+        that:
+          - "'lb1' in lb1_result.stdout_lines"
+          - "'lb2' in lb1_result.stdout_lines"
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        description: web only one
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_backend: [web1]
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5 and C6: send port 80 to web1 only, and add a key"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        description: web only one
+        config:
+          user.purpose: test
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_backend: [web1]
+      register: c6_result
+
+    - name: "C7: exact config removes user.purpose"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        config: {}
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: run C7 again"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        config: {}
+        config_mode: exact
+      register: c8_result
+
+    - name: "LB3: a port that names an unknown backend"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        backends: "{{ backends }}"
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_backend: [web3]
+      register: lb3_result
+      ignore_errors: true
+
+    - name: "C4 to C8 and LB3: check mode, update, exact mode, no change for a second run, and an early error"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.description == 'web only one'
+          - c6_result is changed
+          - c6_result.load_balancer.ports[0].target_backend == ['web1']
+          - c6_result.load_balancer.config['user.purpose'] == 'test'
+          - c6_result.load_balancer.backends | length == 2
+          - c7_result is changed
+          - "'user.purpose' not in c7_result.load_balancer.config"
+          - c8_result is not changed
+          - lb3_result is failed
+          - "'unknown backend web3' in lb3_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the load balancer"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ lb_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.load_balancer is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: "{{ names }}"
+      failed_when: false
+
+    - name: Remove the load balancer
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the OVN network
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the uplink routes
+      smcavoy.lxd.lxd_network:
+        name: "{{ lxd_ovn_uplink }}"
+        config:
+          ipv4.routes: null
+      failed_when: false

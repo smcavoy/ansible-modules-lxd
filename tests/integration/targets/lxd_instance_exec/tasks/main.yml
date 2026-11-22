@@ -1,0 +1,211 @@
+# Goal: lxd_instance_exec runs commands, returns their output, honors ok_rc, creates, and check mode, and cleans up.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_exec tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    ct: "t-{{ lxd_run_id }}-exec"
+  block:
+    - name: Start a container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: "EXC1: read os-release"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [cat, /etc/os-release]
+      register: exc1_result
+
+    - name: "EXC1: the output holds Alpine"
+      ansible.builtin.assert:
+        that:
+          - exc1_result is changed
+          - exc1_result.rc == 0
+          - "'Alpine' in exc1_result.stdout"
+          - exc1_result.stdout_lines | length > 0
+
+    - name: "EXC2: a failing command"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "echo bad >&2; exit 3"]
+      register: exc2_result
+      ignore_errors: true
+
+    - name: "EXC3: ok_rc accepts exit code 1"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "exit 1"]
+        ok_rc: [0, 1]
+      register: exc3_result
+
+    - name: "EXC2 and EXC3: a bad exit code fails with the output, and ok_rc accepts other codes"
+      ansible.builtin.assert:
+        that:
+          - exc2_result is failed
+          - exc2_result.rc == 3
+          - exc2_result.stderr == 'bad\n'
+          - "'exited with code 3' in exc2_result.msg"
+          - exc3_result is not failed
+          - exc3_result.rc == 1
+
+    - name: "EXC4: make a marker file"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [touch, /root/marker]
+        creates: /root/marker
+      register: exc4_first
+
+    - name: "EXC4: run again with creates"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [touch, /root/marker]
+        creates: /root/marker
+      register: exc4_second
+
+    - name: "EXC4: creates skips the command when the path exists"
+      ansible.builtin.assert:
+        that:
+          - exc4_first is changed
+          - exc4_second is not changed
+          - "'exists' in exc4_second.skipped_reason"
+
+    - name: "EXC5: check mode with a command that makes a file"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [touch, /root/check-mode-marker]
+      check_mode: true
+      register: exc5_result
+
+    - name: "EXC5: read the file"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/instances/{{ ct }}/files?path=/root/check-mode-marker"
+      register: exc5_file
+
+    - name: "EXC6: list the output files"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/instances/{{ ct }}/logs/exec-output"
+      register: exc6_server
+
+    - name: "EXC5 and EXC6: check mode does not run the command, and no output files stay"
+      ansible.builtin.assert:
+        that:
+          - exc5_result is changed
+          - exc5_file.status == 404
+          - exc6_server.json.metadata | default([]) | length == 0
+        fail_msg: "output files: {{ exc6_server.json.metadata | default([]) }}"
+
+    # LXD turns the exit code 127 into an error "Command not found". The module returns it as rc.
+    - name: "EXC8: a command that does not exist"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [no-such-command]
+      register: exc8_result
+      ignore_errors: true
+
+    - name: "EXC8: a shell that exits with 127, accepted by ok_rc"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "exit 127"]
+        ok_rc: [127]
+      register: exc8_ok
+
+    - name: "EXC8: exit code 127 comes back as rc"
+      ansible.builtin.assert:
+        that:
+          - exc8_result is failed
+          - exc8_result.rc == 127
+          - "'exited with code 127' in exc8_result.msg"
+          - exc8_ok is not failed
+          - exc8_ok.rc == 127
+
+    - name: "EXC7: environment, user, and cwd"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, 'echo "$GREETING $(id -u) $(pwd)"']
+        environment:
+          GREETING: hello
+        user: 65534
+        group: 65534
+        cwd: /tmp
+      register: exc7_result
+
+    - name: "EXC7: the command sees the environment, the user, and the directory"
+      ansible.builtin.assert:
+        that:
+          - exc7_result.stdout == 'hello 65534 /tmp\n'
+
+    # An operation that runs longer than one 60-second wait slice. LXD answers the slice with
+    # HTTP 500 "context deadline exceeded"; the module must wait on.
+    - name: "EXC10: a command that runs 70 seconds, with timeout 120"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "sleep 70; echo slept"]
+        timeout: 120
+      register: exc10_result
+
+    - name: "EXC10: the module waited past the first slice"
+      ansible.builtin.assert:
+        that:
+          - exc10_result is succeeded
+          - exc10_result.stdout == 'slept\n'
+
+    - name: "EXC11: a command that runs 30 seconds, with timeout 10"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sleep, "30"]
+        timeout: 10
+      register: exc11_result
+      ignore_errors: true
+
+    - name: "EXC11: the module fails with its own deadline text"
+      ansible.builtin.assert:
+        that:
+          - exc11_result is failed
+          - "'did not finish in 10 seconds' in exc11_result.msg"
+          - "'The command can still run in the instance' in exc11_result.msg"
+
+    - name: "EXC12: removes, in an instance that does not exist"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}-missing"
+        command: ["true"]
+        removes: /tmp/no-such-flag
+      register: exc12_result
+      ignore_errors: true
+
+    - name: "EXC12: removes, with a path that does not exist"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: ["true"]
+        removes: /tmp/no-such-flag
+      register: exc12b_result
+
+    - name: "EXC12: a missing instance fails, and a missing path skips the command"
+      ansible.builtin.assert:
+        that:
+          - exc12_result is failed
+          - "'not found' in exc12_result.msg"
+          - exc12b_result is not changed
+          - "'does not exist' in exc12b_result.skipped_reason"
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

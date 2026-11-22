@@ -1,0 +1,169 @@
+# Goal: the modules come through network faults to LXD: a stall, a long break, a break past timeout, a reset during a large download.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the network fault tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-fault"
+    fault: "{{ role_path }}/files/fault.sh"
+    lxd_port: "{{ lxd_url | urlsplit('port') | default(8443, true) }}"
+    work: "{{ output_dir | default('/tmp') }}"
+  block:
+    - name: The controller can change its firewall
+      ansible.builtin.command: iptables -S OUTPUT
+      changed_when: false
+
+    - name: Clear faults from an earlier run
+      ansible.builtin.command: "{{ fault }} clear"
+      changed_when: false
+
+    - name: Start a container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        state: started
+
+    # FN1: packets are lost for 20 seconds while the module waits on an operation.
+    - name: "FN1: lose all packets for 20 s, 10 s into a 50 s command"
+      ansible.builtin.command: "{{ fault }} start {{ lxd_sandbox_ip }} {{ lxd_port }} drop 10 20"
+      changed_when: true
+    - name: "FN1: the command"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "sleep 50; echo fn1"]
+        timeout: 180
+      register: fn1_result
+    - name: "FN1: the module waited through the stall"
+      ansible.builtin.assert:
+        that:
+          - fn1_result is succeeded
+          - fn1_result.stdout == 'fn1\n'
+
+    # FN2: the connection breaks with resets for 60 seconds. That is longer than the read retries of one
+    # wait request, so the module must keep trying until timeout.
+    # The command must end well after the break (110 s). LXD keeps a finished operation only a short time: a
+    # command that ends in the break is gone when the module comes back, and the task fails.
+    - name: "FN2: reset all connections for 60 s, 50 s into a 140 s command"
+      ansible.builtin.command: "{{ fault }} start {{ lxd_sandbox_ip }} {{ lxd_port }} reset 50 60"
+      changed_when: true
+    - name: "FN2: the command"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "sleep 140; echo fn2"]
+        timeout: 300
+      register: fn2_result
+    - name: "FN2: the module came back after the break"
+      ansible.builtin.assert:
+        that:
+          - fn2_result is succeeded
+          - fn2_result.stdout == 'fn2\n'
+
+    # FN3: the break lasts longer than timeout. The task fails with a clear text, and the operation
+    # finishes on the server anyway.
+    - name: "FN3: reset all connections for 110 s, 5 s into a 60 s command with timeout 40"
+      ansible.builtin.command: "{{ fault }} start {{ lxd_sandbox_ip }} {{ lxd_port }} reset 5 110"
+      changed_when: true
+    - name: "FN3: the command"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "sleep 60; touch /root/fn3-done"]
+        timeout: 40
+      register: fn3_result
+      ignore_errors: true
+    - name: "FN3: wait until the fault ends"
+      ansible.builtin.shell: "iptables -S | grep -c -- '--comment lxd-fault' || true"
+      register: fn3_rules
+      until: fn3_rules.stdout | int == 0
+      retries: 60
+      delay: 5
+      changed_when: false
+    - name: "FN3: read the marker that the command makes"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [test, -f, /root/fn3-done]
+      register: fn3_marker
+      ignore_errors: true
+    - name: "FN3: the task failed with its own text, and the command still ran to the end"
+      ansible.builtin.assert:
+        that:
+          - fn3_result is failed
+          - "'did not finish in 40 seconds' in fn3_result.msg"
+          - "'The command can still run in the instance' in fn3_result.msg"
+          - fn3_marker is succeeded
+
+    # FN4: a reset in the middle of a large download. The read retry starts the file again, and the
+    # file is complete.
+    - name: "FN4: write 60 MiB of random data in the container"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [dd, if=/dev/urandom, of=/root/big, bs=1M, count=60]
+    - name: "FN4: read the checksum of the data"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sha256sum, /root/big]
+      register: fn4_sum
+    - name: "FN4: make a backup on the server"
+      smcavoy.lxd.lxd_instance_backup:
+        instance: "{{ ct }}"
+        name: fn4
+        compression_algorithm: none
+    - name: "FN4: slow the link down, and reset it for 3 s, 6 s into the download"
+      ansible.builtin.shell: >-
+        {{ fault }} start {{ lxd_sandbox_ip }} {{ lxd_port }} slow 0 0 &&
+        {{ fault }} start {{ lxd_sandbox_ip }} {{ lxd_port }} reset 6 3
+      changed_when: true
+    - name: "FN4: download the backup"
+      smcavoy.lxd.lxd_instance_backup:
+        instance: "{{ ct }}"
+        name: fn4
+        dest: "{{ work }}/fn4.tar"
+        timeout: 300
+      register: fn4_result
+    - name: "FN4: remove the slow link"
+      ansible.builtin.command: "{{ fault }} clear"
+      changed_when: true
+    - name: "FN4: read the downloaded file"
+      ansible.builtin.stat:
+        path: "{{ work }}/fn4.tar"
+      register: fn4_stat
+    - name: "FN4: unpack the data file from the backup"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        tar -xOf {{ work }}/fn4.tar --wildcards '*/rootfs/root/big' | sha256sum | cut -d' ' -f1
+      args:
+        executable: /bin/bash
+      register: fn4_unpacked
+      changed_when: false
+    - name: "FN4: the download is complete and the data is the same"
+      ansible.builtin.assert:
+        that:
+          - fn4_result is succeeded
+          - fn4_result.size == fn4_stat.stat.size
+          - fn4_stat.stat.size > 60 * 1024 * 1024
+          - fn4_unpacked.stdout == fn4_sum.stdout.split()[0]
+  always:
+    - name: Clear the faults
+      ansible.builtin.command: "{{ fault }} clear"
+      changed_when: true
+      failed_when: false
+
+    - name: Remove the backup file
+      ansible.builtin.file:
+        path: "{{ work }}/fn4.tar"
+        state: absent
+
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

@@ -1,0 +1,44 @@
+# Goal: lxd_server_info reads the server, the resources, the state, and the config metadata.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_server_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: "SI1 to SI4: read all parts"
+      smcavoy.lxd.lxd_server_info:
+        gather: [server, resources, state, metadata]
+      register: si_result
+
+    - name: "I4: read all parts in check mode"
+      smcavoy.lxd.lxd_server_info:
+        gather: [server, resources, state, metadata]
+      check_mode: true
+      register: i4_result
+
+    # The key name holds dots, so the lookup goes through dict2items and not through attribute paths.
+    - name: "SI3: find the scope of core.https_address"
+      ansible.builtin.set_fact:
+        si3_scope: >-
+          {{ si_result.metadata.configs.server.values() | map(attribute='keys') | flatten | map('dict2items') | flatten
+             | selectattr('key', 'eq', 'core.https_address') | map(attribute='value.scope') | first }}
+
+    - name: "SI1 to SI4: version, CPUs, key scope, and state"
+      ansible.builtin.assert:
+        that:
+          - si_result is not changed
+          - si_result.server.environment.server_version is version('6.10.1', '>=')
+          - si_result.resources.cpu.total == 2
+          - si3_scope == 'local'
+          - si_result.state is mapping
+          - i4_result is not changed
+          - i4_result.server.environment.server_version == si_result.server.environment.server_version

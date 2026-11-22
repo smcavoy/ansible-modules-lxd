@@ -1,0 +1,192 @@
+# Goal: lxd_trust_token issues a token that a new client uses to join, issues one token per name, and revokes tokens.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_trust_token tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  block:
+    - name: Make a folder for a new client certificate
+      ansible.builtin.tempfile:
+        state: directory
+      register: cert_dir
+
+    - name: Make a new client certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - ec
+          - -pkeyopt
+          - ec_paramgen_curve:secp384r1
+          - -nodes
+          - -days
+          - "1"
+          - -subj
+          - /CN=t-{{ lxd_run_id }}-client
+          - -keyout
+          - "{{ cert_dir.path }}/client.key"
+          - -out
+          - "{{ cert_dir.path }}/client.crt"
+      changed_when: true
+
+    - name: "TT0: check mode predicts a token"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt"
+      check_mode: true
+      register: tt0_result
+
+    - name: "TT1: issue a token"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt"
+      register: tt1_result
+      no_log: true
+
+    - name: "TT2: run again"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt"
+      register: tt2_result
+
+    - name: "TT1: the new client adds itself with the token"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/certificates"
+        method: POST
+        client_cert: "{{ cert_dir.path }}/client.crt"
+        client_key: "{{ cert_dir.path }}/client.key"
+        ca_path: "{{ lxd_server_cert }}"
+        body_format: json
+        body:
+          type: client
+          trust_token: "{{ tt1_result.token }}"
+        status_code: [200, 201, 202]
+      no_log: true
+
+    - name: "TT1: the new client calls the API"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        client_cert: "{{ cert_dir.path }}/client.crt"
+        client_key: "{{ cert_dir.path }}/client.key"
+        ca_path: "{{ lxd_server_cert }}"
+      register: tt1_call
+
+    - name: "TT0 to TT2: check mode issues none, the token works, and a second run issues none"
+      ansible.builtin.assert:
+        that:
+          - tt0_result is changed
+          - tt0_result.token is not defined
+          - tt1_result is changed
+          - (tt1_result.token | b64decode | from_json).client_name == 't-' ~ lxd_run_id ~ '-tt'
+          - tt1_call.json.metadata.auth == 'trusted'
+          - tt2_result is not changed
+          - tt2_result.token is not defined
+
+    # A trust token works once, so check mode must not use it.
+    - name: "TT4: make a second client certificate"
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - ec
+          - -pkeyopt
+          - ec_paramgen_curve:secp384r1
+          - -nodes
+          - -days
+          - "1"
+          - -subj
+          - /CN=t-{{ lxd_run_id }}-client4
+          - -keyout
+          - "{{ cert_dir.path }}/client4.key"
+          - -out
+          - "{{ cert_dir.path }}/client4.crt"
+      changed_when: true
+
+    - name: "TT4: issue a token for the second client"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt4"
+      register: tt4_token
+      no_log: true
+
+    - name: "TT4: a module in check mode with the token and the untrusted client"
+      smcavoy.lxd.lxd_server_info:
+        client_cert: "{{ cert_dir.path }}/client4.crt"
+        client_key: "{{ cert_dir.path }}/client4.key"
+        trust_token: "{{ tt4_token.token }}"
+      check_mode: true
+      register: tt4_check
+      ignore_errors: true
+
+    - name: "TT4: the same task outside check mode"
+      smcavoy.lxd.lxd_server_info:
+        client_cert: "{{ cert_dir.path }}/client4.crt"
+        client_key: "{{ cert_dir.path }}/client4.key"
+        trust_token: "{{ tt4_token.token }}"
+      register: tt4_real
+
+    - name: "TT4: check mode fails and keeps the token, which then works"
+      ansible.builtin.assert:
+        that:
+          - tt4_check is failed
+          - "'only outside check mode' in tt4_check.msg"
+          - tt4_real is succeeded
+          - tt4_real.server.auth == 'trusted'
+
+    - name: "TT3: issue a token for another name"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt3"
+      register: tt3_issue
+      no_log: true
+
+    - name: "TT3: revoke it"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt3"
+        state: absent
+      register: tt3_result
+
+    - name: "TT3: revoke again"
+      smcavoy.lxd.lxd_trust_token:
+        name: "t-{{ lxd_run_id }}-tt3"
+        state: absent
+      register: tt3_again
+
+    - name: "TT3: the revoke ends the token, and a second revoke makes no change"
+      ansible.builtin.assert:
+        that:
+          - tt3_result is changed
+          - tt3_issue.operation in tt3_result.revoked
+          - tt3_again is not changed
+  always:
+    - name: Revoke the test tokens
+      smcavoy.lxd.lxd_trust_token:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "t-{{ lxd_run_id }}-tt"
+        - "t-{{ lxd_run_id }}-tt3"
+        - "t-{{ lxd_run_id }}-tt4"
+      failed_when: false
+
+    - name: Remove the trust entries of the new clients
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/' ~ item) }}"
+        state: absent
+      loop:
+        - client.crt
+        - client4.crt
+      when: cert_dir.path is defined
+      failed_when: false
+
+    - name: Remove the certificate folder
+      ansible.builtin.file:
+        path: "{{ cert_dir.path }}"
+        state: absent
+      when: cert_dir.path is defined

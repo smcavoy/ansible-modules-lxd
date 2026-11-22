@@ -1,0 +1,88 @@
+# Goal: lxd_profile_info lists profiles, reads one, gives an empty list for a missing name, and reads all projects.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_profile_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: Create a test profile and a project with its own profiles
+      smcavoy.lxd.lxd_profile:
+        name: "{{ run }}-prof"
+
+    - name: Create the test project
+      smcavoy.lxd.lxd_project:
+        name: "{{ run }}-pi"
+
+    - name: Create a profile in the test project
+      smcavoy.lxd.lxd_profile:
+        name: "{{ run }}-inproj"
+        project: "{{ run }}-pi"
+
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_profile_info:
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_profile_info:
+        name: "{{ run }}-prof"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_profile_info:
+        name: no-such-profile
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_profile_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: the list holds the test object, one by name works, a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - (run ~ "-prof") in (i1_result.profiles | map(attribute='name') | list)
+          - i2_result.profiles | length == 1
+          - i2_result.profiles[0].name == (run ~ "-prof")
+          - i3_result is not changed
+          - i3_result.profiles == []
+          - i4_result is not changed
+          - i4_result.profiles | length == i1_result.profiles | length
+
+    - name: "PRI1: read the profiles of all projects"
+      smcavoy.lxd.lxd_profile_info:
+        all_projects: true
+      register: pri1_result
+
+    - name: "PRI1: the list holds the profile of the test project, with its project"
+      ansible.builtin.assert:
+        that:
+          - pri1_result.profiles | selectattr('name', 'eq', run ~ '-inproj') | map(attribute='project') | list == [run ~ '-pi']
+  always:
+    - name: Remove the profile of the test project
+      smcavoy.lxd.lxd_profile:
+        name: "{{ run }}-inproj"
+        project: "{{ run }}-pi"
+        state: absent
+      failed_when: false
+
+    - name: Remove the test project
+      smcavoy.lxd.lxd_project:
+        name: "{{ run }}-pi"
+        state: absent
+      failed_when: false
+
+    - name: Remove the test profile
+      smcavoy.lxd.lxd_profile:
+        name: "{{ run }}-prof"
+        state: absent
+      failed_when: false

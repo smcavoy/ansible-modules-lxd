@@ -1,0 +1,151 @@
+# Goal: lxd_network creates a bridge on a cluster with member-specific keys, idempotently, and fails on a network whose create did not finish.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_cluster tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    net: "t{{ lxd_run_id }}cb"
+    pending_net: "t{{ lxd_run_id }}pn"
+    errored_net: "t{{ lxd_run_id }}mv"
+  block:
+    - name: "N1: build member_config with a BGP next hop per member"
+      ansible.builtin.set_fact:
+        n1_member_config: "{{ n1_member_config | default({}) | combine({item.1: {'bgp.ipv4.nexthop': '192.0.2.' ~ (item.0 + 1)}}) }}"
+      loop: "{{ range(lxd_members | length) | zip(lxd_members) | list }}"
+
+    - name: "N1: create a bridge with a global address and a member key per member"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.address: 10.124.0.1/24
+          ipv6.address: none
+        member_config: "{{ n1_member_config }}"
+      register: n1_result
+
+    - name: "N1: read the bridge on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/networks/{{ net }}?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: n1_server
+
+    - name: "N1: each member has its own next hop and the global address"
+      ansible.builtin.assert:
+        that:
+          - n1_result is changed
+          # Keys with dots need item access. An attribute path would read the dots as nesting.
+          - n1_server.results[0].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.1'
+          - n1_server.results[1].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.2'
+          - n1_server.results[2].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.3'
+          - n1_server.results[0].json.metadata.config['ipv4.address'] == '10.124.0.1/24'
+          - n1_server.results[2].json.metadata.config['ipv4.address'] == '10.124.0.1/24'
+        fail_msg: "{{ n1_server.results | map(attribute='json.metadata.config') | list | to_json }}"
+
+    - name: "N2: run N1 again"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.address: 10.124.0.1/24
+          ipv6.address: none
+        member_config: "{{ n1_member_config }}"
+      register: n2_result
+
+    - name: "N3: change the key of one member"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        # Ansible does not template dictionary keys, so the key comes from a Jinja dictionary.
+        member_config: "{{ {lxd_members[1]: {'bgp.ipv4.nexthop': '192.0.2.22'}} }}"
+      register: n3_result
+
+    - name: "N3: read the bridge on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/networks/{{ net }}?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: n3_server
+
+    - name: "N2 and N3: a second run makes no change, and a change reaches only its member"
+      ansible.builtin.assert:
+        that:
+          - n2_result is not changed
+          - n3_result is changed
+          - n3_server.results[0].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.1'
+          - n3_server.results[1].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.22'
+          - n3_server.results[2].json.metadata.config['bgp.ipv4.nexthop'] == '192.0.2.3'
+          # LXD replaces the whole config on a PUT with a target. The global keys must stay (review 2026-11-13).
+          - n3_server.results[0].json.metadata.config['ipv4.address'] == '10.124.0.1/24'
+          - n3_server.results[1].json.metadata.config['ipv4.address'] == '10.124.0.1/24'
+          - n3_server.results[1].json.metadata.config['ipv6.address'] == 'none'
+
+    # A create that stops after the member step leaves the network Pending.
+    - name: "N4: create a bridge on one member only"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/networks?target={{ lxd_members[0] }}"
+        method: POST
+        body:
+          name: "{{ pending_net }}"
+          type: bridge
+    - name: "N4: the task for the Pending bridge"
+      smcavoy.lxd.lxd_network:
+        name: "{{ pending_net }}"
+      register: n4_result
+      ignore_errors: true
+    - name: "N4: remove the Pending bridge"
+      smcavoy.lxd.lxd_network:
+        name: "{{ pending_net }}"
+        state: absent
+      register: n4_absent
+
+    # A macvlan network with a parent that does not exist: the cluster step fails, and the network is Errored.
+    - name: "N5: create a macvlan network with a missing parent"
+      smcavoy.lxd.lxd_network:
+        name: "{{ errored_net }}"
+        type: macvlan
+        config:
+          parent: lxdtnope0
+      register: n5_create
+      ignore_errors: true
+    - name: "N5: the same task again"
+      smcavoy.lxd.lxd_network:
+        name: "{{ errored_net }}"
+        type: macvlan
+        config:
+          parent: lxdtnope0
+      register: n5_result
+      ignore_errors: true
+    - name: "N5: remove the Errored network"
+      smcavoy.lxd.lxd_network:
+        name: "{{ errored_net }}"
+        state: absent
+      register: n5_absent
+
+    - name: "N4 and N5: a network whose create did not finish fails with its status, and state=absent removes it"
+      ansible.builtin.assert:
+        that:
+          - n4_result is failed
+          - "'has the status Pending' in n4_result.msg"
+          - n4_absent is changed
+          - n5_create is failed
+          - "'lxdtnope0' in n5_create.msg"
+          - n5_result is failed
+          - "'has the status Errored' in n5_result.msg"
+          - n5_absent is changed
+  always:
+    - name: Remove the test networks
+      smcavoy.lxd.lxd_network:
+        name: "{{ item }}"
+        state: absent
+      loop: ["{{ net }}", "{{ pending_net }}", "{{ errored_net }}"]
+      failed_when: false

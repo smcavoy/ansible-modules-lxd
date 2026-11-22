@@ -1,0 +1,51 @@
+# Goal: lxd_cluster_member_info lists members, reads one with its state, and gives an empty list for a missing name.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster_member_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  block:
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_cluster_member_info:
+      register: i1_result
+
+    - name: "I2 and CMI1: one by name, with its state"
+      smcavoy.lxd.lxd_cluster_member_info:
+        name: "{{ lxd_members[0] }}"
+        include_state: true
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_cluster_member_info:
+        name: no-such-member
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_cluster_member_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4 and CMI1: the reads find the members"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - i1_result.clustered is true
+          - i1_result.members | map(attribute='server_name') | sort == lxd_members | sort
+          - i2_result.members | length == 1
+          - i2_result.members[0].state.sysinfo.total_ram > 0
+          - i3_result.members == []
+          - i4_result is not changed
+          - i4_result.members | length == lxd_members | length

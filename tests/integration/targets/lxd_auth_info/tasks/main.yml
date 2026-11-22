@@ -1,0 +1,64 @@
+# Goal: lxd_auth_info shows the current identity, lists identities and groups, and filters permissions.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_auth_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  block:
+    - name: Create a test group
+      smcavoy.lxd.lxd_auth_group:
+        name: "t-{{ lxd_run_id }}-ag"
+        permissions:
+          - entity_type: project
+            url: /1.0/projects/default
+            entitlement: viewer
+
+    - name: "AU1: read the current identity"
+      smcavoy.lxd.lxd_auth_info:
+      register: au1_result
+
+    - name: "AU2: read the TLS identities, the groups, and the provider groups"
+      smcavoy.lxd.lxd_auth_info:
+        gather: [identities, groups, identity_provider_groups]
+        identity_type: tls
+        include_effective_groups: true
+      register: au2_result
+
+    - name: "AU3: read the project permissions"
+      smcavoy.lxd.lxd_auth_info:
+        gather: [permissions]
+        entity_type: project
+      register: au3_result
+
+    - name: "AU4: read in check mode"
+      smcavoy.lxd.lxd_auth_info:
+      check_mode: true
+      register: au4_result
+
+    - name: "AU1 to AU4: the client, the identities, the group, and only project permissions"
+      ansible.builtin.assert:
+        that:
+          - au1_result is not changed
+          - au1_result.current.authentication_method == 'tls'
+          - au2_result.identities | length >= 1
+          - au2_result.identities | map(attribute='authentication_method') | unique | list == ['tls']
+          - au2_result.identities | map(attribute='effective_groups') | list | length == au2_result.identities | length
+          - ('t-' ~ lxd_run_id ~ '-ag') in (au2_result.groups | map(attribute='name') | list)
+          - au2_result.identity_provider_groups is sequence
+          - au3_result.permissions | length > 0
+          - au3_result.permissions | map(attribute='entity_type') | unique | list == ['project']
+          - au4_result is not changed
+          - au4_result.current.authentication_method == 'tls'
+  always:
+    - name: Remove the test group
+      smcavoy.lxd.lxd_auth_group:
+        name: "t-{{ lxd_run_id }}-ag"
+        state: absent
+      failed_when: false

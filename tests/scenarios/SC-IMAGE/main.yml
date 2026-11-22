@@ -1,0 +1,166 @@
+# Goal: SC-IMAGE publishes an instance as an image, launches a new instance from it, exports the image, and imports it again.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-IMAGE image round trip
+  hosts: localhost
+  gather_facts: false
+  vars:
+    img_source: "t-{{ lxd_run_id }}-imgsrc"
+    img_clone: "t-{{ lxd_run_id }}-imgclone"
+    img_alias: "t-{{ lxd_run_id }}/golden"
+    img_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/sc-image-{{ lxd_run_id }}.tar.gz"
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-IMAGE 1: start a source container"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ img_source }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-IMAGE 2: put a marker into the source container"
+          smcavoy.lxd.lxd_instance_file:
+            instance: "{{ img_source }}"
+            path: /etc/golden-marker
+            content: "golden {{ lxd_run_id }}\n"
+
+        - name: "SC-IMAGE 3: stop the source container for the publish"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ img_source }}"
+            state: stopped
+
+        - name: "SC-IMAGE 4: publish the container as an image"
+          smcavoy.lxd.lxd_image:
+            aliases:
+              - name: "{{ img_alias }}"
+                description: Golden image of the scenario
+            properties:
+              os: Alpine
+              purpose: sc-image
+            source:
+              instance: "{{ img_source }}"
+          register: sc_publish
+
+        - name: "SC-IMAGE 5: launch a new container from the image"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ img_clone }}"
+            source:
+              image: "{{ img_alias }}"
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-IMAGE 6: read the marker in the new container"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ img_clone }}"
+            command: [cat, /etc/golden-marker]
+          register: sc_marker
+
+        - name: "SC-IMAGE 6: the new container has the marker"
+          ansible.builtin.assert:
+            that:
+              - sc_publish is changed
+              - sc_marker.stdout == 'golden ' ~ lxd_run_id ~ '\n'
+
+        - name: "SC-IMAGE 7: export the image to a file"
+          ansible.builtin.uri:
+            url: "{{ lxd_url }}/1.0/images/{{ sc_publish.image.fingerprint }}/export"
+            client_cert: "{{ lxd_client_cert }}"
+            client_key: "{{ lxd_client_key }}"
+            ca_path: "{{ lxd_server_cert }}"
+            dest: "{{ img_file }}"
+            force: true
+          register: sc_export
+          # LXD sometimes resets a connection right after a change. A read is safe to repeat.
+          until: sc_export is succeeded
+          retries: 3
+          delay: 2
+
+        - name: "SC-IMAGE 8: delete the new container and the image"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ img_clone }}"
+            state: absent
+            force: true
+
+        - name: "SC-IMAGE 8: delete the image"
+          smcavoy.lxd.lxd_image:
+            aliases:
+              - name: "{{ img_alias }}"
+            state: absent
+
+        - name: "SC-IMAGE 9: import the image from the file"
+          smcavoy.lxd.lxd_image:
+            aliases:
+              - name: "{{ img_alias }}"
+            properties:
+              os: Alpine
+              purpose: sc-image
+            source:
+              path: "{{ img_file }}"
+          register: sc_import
+
+        - name: "SC-IMAGE 10: launch a container from the imported image"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ img_clone }}"
+            source:
+              image: "{{ img_alias }}"
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-IMAGE 10: read the marker again"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ img_clone }}"
+            command: [cat, /etc/golden-marker]
+          register: sc_marker_again
+
+        - name: "SC-IMAGE 11: run the import again"
+          smcavoy.lxd.lxd_image:
+            aliases:
+              - name: "{{ img_alias }}"
+            properties:
+              os: Alpine
+              purpose: sc-image
+            source:
+              path: "{{ img_file }}"
+          register: sc_import_again
+
+        - name: "SC-IMAGE 11: the import keeps the fingerprint, the marker is there, and a second run makes no change"
+          ansible.builtin.assert:
+            that:
+              - sc_import is changed
+              - sc_import.image.fingerprint == sc_publish.image.fingerprint
+              - sc_import.image.properties.purpose == 'sc-image'
+              - sc_marker_again.stdout == 'golden ' ~ lxd_run_id ~ '\n'
+              - sc_import_again is not changed
+      always:
+        - name: Remove the containers
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item }}"
+            state: absent
+            force: true
+          loop:
+            - "{{ img_clone }}"
+            - "{{ img_source }}"
+          failed_when: false
+
+        - name: Remove the image
+          smcavoy.lxd.lxd_image:
+            aliases:
+              - name: "{{ img_alias }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the exported file
+          ansible.builtin.file:
+            path: "{{ img_file }}"
+            state: absent

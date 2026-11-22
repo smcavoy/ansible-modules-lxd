@@ -1,0 +1,57 @@
+# Goal: lxd_storage_pool_info lists pools, reads one with its resources, and gives an empty list for a missing name.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_pool_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_storage_pool_info:
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_storage_pool_info:
+        name: "{{ lxd_pool }}"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_storage_pool_info:
+        name: no-such-pool
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_storage_pool_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I1 to I4: the list holds the test object, one by name works, a missing name gives an empty list"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - lxd_pool in (i1_result.storage_pools | map(attribute='name') | list)
+          - i2_result.storage_pools | length == 1
+          - i2_result.storage_pools[0].name == lxd_pool
+          - i3_result is not changed
+          - i3_result.storage_pools == []
+          - i4_result is not changed
+          - i4_result.storage_pools | length == i1_result.storage_pools | length
+
+    - name: "SPI1: read the pool with its resources"
+      smcavoy.lxd.lxd_storage_pool_info:
+        name: "{{ lxd_pool }}"
+        include_resources: true
+      register: spi1_result
+
+    - name: "SPI1: include_resources gives a total size"
+      ansible.builtin.assert:
+        that:
+          - spi1_result.storage_pools[0].resources.space.total > 0

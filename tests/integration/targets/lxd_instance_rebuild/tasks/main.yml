@@ -1,0 +1,175 @@
+# Goal: lxd_instance_rebuild replaces the root disk, keeps the config, refuses a running instance without force, and does nothing in check mode.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_rebuild tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+  vars:
+    ct: "t-{{ lxd_run_id }}-rebuild"
+    probe: [sh, -c, "test -e /root/marker && echo yes || echo no"]
+    # A file of the image that the test removes. Only a root disk made from the image has it again.
+    image_probe: [sh, -c, "test -s /etc/os-release && echo yes || echo no"]
+    inst_url: "{{ lxd_url }}/1.0/instances/{{ ct }}"
+  block:
+    - name: Start a container with a CPU limit
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        config:
+          limits.cpu: "1"
+        state: started
+
+    - name: Write a marker on the root disk
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "echo old > /root/marker && sync"]
+
+    - name: Remove a file of the image from the root disk
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "rm /etc/os-release && sync"]
+
+    - name: Read the instance from the server before the rebuilds
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+        status_code: 200
+      register: rb_before
+      retries: 3
+      delay: 2
+      until: rb_before is not failed
+
+    - name: "RB3: rebuild a running container without force"
+      smcavoy.lxd.lxd_instance_rebuild:
+        instance: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+      register: rb3_result
+      ignore_errors: true
+
+    - name: "RB0: rebuild in check mode"
+      smcavoy.lxd.lxd_instance_rebuild:
+        instance: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        force: true
+      check_mode: true
+      register: rb0_result
+
+    - name: "RB0: the marker is still there"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ probe }}"
+      register: rb0_marker
+
+    - name: "RB0: the file of the image is still gone"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ image_probe }}"
+      register: rb0_image
+
+    - name: "RB0: read the instance from the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+        status_code: 200
+      register: rb0_server
+      retries: 3
+      delay: 2
+      until: rb0_server is not failed
+
+    - name: "RB1 and RB2: rebuild with force"
+      smcavoy.lxd.lxd_instance_rebuild:
+        instance: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        force: true
+      register: rb1_result
+
+    - name: "RB1: look for the marker"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ probe }}"
+      register: rb1_marker
+
+    - name: "RB1: look for the file of the image"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ image_probe }}"
+      register: rb1_image
+
+    - name: "RB1: read the instance from the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+        status_code: 200
+      register: rb1_server
+      retries: 3
+      delay: 2
+      until: rb1_server is not failed
+
+    - name: "RB4: rebuild with an empty root disk, and leave it stopped"
+      smcavoy.lxd.lxd_instance_rebuild:
+        instance: "{{ ct }}"
+        source:
+          empty: true
+        force: true
+        start: false
+      register: rb4_result
+
+    - name: "RB4: read the instance from the server"
+      ansible.builtin.uri:
+        url: "{{ inst_url }}"
+        status_code: 200
+      register: rb4_server
+      retries: 3
+      delay: 2
+      until: rb4_server is not failed
+
+    - name: "RB0 to RB4: check mode does nothing, a rebuild clears the root disk and keeps the config, and a running instance needs force"
+      ansible.builtin.assert:
+        that:
+          - rb3_result is failed
+          - "'force' in rb3_result.msg"
+          - rb0_result is changed
+          - rb0_marker.stdout == 'yes\n'
+          - rb1_result is changed
+          - rb1_result.instance.status == 'Running'
+          - rb1_result.instance.config['limits.cpu'] == '1'
+          - rb1_marker.stdout == 'no\n'
+          - rb4_result is changed
+          - rb4_result.instance.status == 'Stopped'
+          - rb4_result.instance.config['limits.cpu'] == '1'
+
+    # The independent reads: lxd_instance_exec in the instance, and the instance over the REST API.
+    - name: "RB0 to RB4: the server and the root disk agree"
+      ansible.builtin.assert:
+        that:
+          - rb_before.json.metadata.config['volatile.base_image'] | length == 64
+          - rb0_image.stdout == 'no\n'
+          - rb0_server.json.metadata.status == 'Running'
+          - rb1_image.stdout == 'yes\n'
+          - rb1_server.json.metadata.status == 'Running'
+          - rb1_server.json.metadata.config['limits.cpu'] == '1'
+          - rb1_server.json.metadata.config['volatile.base_image'] == rb_before.json.metadata.config['volatile.base_image']
+          - rb4_server.json.metadata.status == 'Stopped'
+          - rb4_server.json.metadata.config['limits.cpu'] == '1'
+          - "'volatile.base_image' not in rb4_server.json.metadata.config"
+          - rb4_server.json.metadata.config | select('match', 'image\\.') | list == []
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

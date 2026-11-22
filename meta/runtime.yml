@@ -1,0 +1,71 @@
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+requires_ansible: ">=2.19.0"
+action_groups:
+  lxd:
+    - lxd_auth_group
+    - lxd_auth_identity
+    - lxd_auth_identity_provider_group
+    - lxd_auth_identity_token
+    - lxd_auth_info
+    - lxd_cluster
+    - lxd_cluster_certificate
+    - lxd_cluster_group
+    - lxd_cluster_join_token
+    - lxd_cluster_link
+    - lxd_cluster_link_info
+    - lxd_cluster_member
+    - lxd_cluster_member_info
+    - lxd_image
+    - lxd_image_alias
+    - lxd_image_export
+    - lxd_image_info
+    - lxd_image_registry
+    - lxd_image_registry_info
+    - lxd_instance
+    - lxd_instance_backup
+    - lxd_instance_device
+    - lxd_instance_exec
+    - lxd_instance_file
+    - lxd_instance_info
+    - lxd_instance_log_info
+    - lxd_instance_metadata
+    - lxd_instance_rebuild
+    - lxd_instance_snapshot
+    - lxd_network
+    - lxd_network_acl
+    - lxd_network_acl_info
+    - lxd_network_allocation_info
+    - lxd_network_forward
+    - lxd_network_info
+    - lxd_network_load_balancer
+    - lxd_network_load_balancer_pool
+    - lxd_network_peer
+    - lxd_network_zone
+    - lxd_network_zone_record
+    - lxd_operation_info
+    - lxd_placement_group
+    - lxd_profile
+    - lxd_profile_info
+    - lxd_project
+    - lxd_project_info
+    - lxd_replicator
+    - lxd_replicator_info
+    - lxd_replicator_run
+    - lxd_server_config
+    - lxd_server_info
+    - lxd_storage_bucket
+    - lxd_storage_bucket_key
+    - lxd_storage_pool
+    - lxd_storage_pool_info
+    - lxd_storage_volume
+    - lxd_storage_volume_backup
+    - lxd_storage_volume_info
+    - lxd_storage_volume_snapshot
+    - lxd_trust_certificate
+    - lxd_trust_token
+    - lxd_warning
+    - lxd_warning_info

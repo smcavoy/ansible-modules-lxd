@@ -1,0 +1,386 @@
+# Goal: lxd_replicator creates, updates, and deletes replicators idempotently, keeps the cluster key, and lxd_replicator_info reads them.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_replicator and lxd_replicator_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    link_a: "t-{{ lxd_run_id }}-rpa"
+    link_b: "t-{{ lxd_run_id }}-rpb"
+    proj: "t-{{ lxd_run_id }}-rp"
+    rep: web-dr
+    rep_url: "{{ lxd_url }}/1.0/replicators/{{ rep }}?project={{ proj }}"
+    peer:
+      url: "{{ lxd_peer_url }}"
+      server_cert: "{{ lxd_peer_server_cert }}"
+    link_group: "t-{{ lxd_run_id }}-links"
+    link_permissions:
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: operator
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: can_edit
+    features:
+      features.images: "false"
+      features.profiles: "false"
+      features.storage.volumes: "false"
+      features.storage.buckets: "false"
+  block:
+    - name: "create the project on A"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config: "{{ features }}"
+
+    - name: "create the project on B"
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        config: "{{ features }}"
+
+    - name: "let the cluster links work on the project of A"
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ link_group }}"
+        permissions: "{{ link_permissions }}"
+
+    - name: "let the cluster links work on the project of B"
+      smcavoy.lxd.lxd_auth_group:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_group }}"
+        permissions: "{{ link_permissions }}"
+
+    - name: "make a pending link on B"
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_b }}"
+        auth_groups: ["{{ link_group }}"]
+      register: pending
+      no_log: true
+
+    - name: "activate the link on A"
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ link_a }}"
+        trust_token: "{{ pending.trust_token }}"
+        auth_groups: ["{{ link_group }}"]
+      no_log: true
+
+    - name: "point the project on A at B"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config:
+          replica.cluster: "{{ link_a }}"
+
+    - name: "point the project on B at A, in standby mode"
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        config:
+          replica.cluster: "{{ link_b }}"
+        replica_mode: standby
+
+    - name: "C1: check mode predicts a replicator"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        config:
+          cluster: "{{ link_a }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ rep_url }}"
+      register: c1_server
+
+    - name: "C2: create the replicator"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        description: to B
+        config:
+          cluster: "{{ link_a }}"
+          user.extra: "1"
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        description: to B
+        config:
+          cluster: "{{ link_a }}"
+          user.extra: "1"
+      register: c3_result
+
+    - name: "C2: log the replicator"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT replicator {{ c2_result.replicator | to_json }}"
+
+    - name: "C1 to C3: check mode does nothing, the replicator exists, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.replicator.config.cluster == link_a
+          - c2_result.replicator.description == 'to B'
+          - c2_result.replicator.project == proj
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        description: to B every day
+        config:
+          schedule: "@daily"
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5 and C6: add a schedule and change the description"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        description: to B every day
+        config:
+          schedule: "@daily"
+      register: c6_result
+
+    - name: "C7 and RP1: exact config removes user.extra and keeps cluster"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        config:
+          schedule: "@daily"
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: run C7 again"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        config:
+          schedule: "@daily"
+        config_mode: exact
+      register: c8_result
+
+    - name: "C4 to C8 and RP1: check mode, update, exact mode that keeps cluster, and no change for a second run"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.config.schedule == '@daily'
+          - c6_result is changed
+          - c6_result.replicator.config.schedule == '@daily'
+          - c6_result.replicator.config['user.extra'] == '1'
+          - c6_result.replicator.description == 'to B every day'
+          - c7_result is changed
+          - "c7_result.replicator.config == {'cluster': link_a, 'schedule': '@daily'}"
+          - c8_result is not changed
+
+    - name: "B1: a new replicator without a cluster"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: no-cluster
+        config:
+          schedule: "@daily"
+      register: b1_result
+      ignore_errors: true
+
+    - name: "B2: a bad cron expression"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        config:
+          schedule: every day
+      register: b2_result
+      ignore_errors: true
+
+    - name: "B3: a second replicator for the same link"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: second
+        config:
+          cluster: "{{ link_a }}"
+      register: b3_result
+      ignore_errors: true
+
+    - name: "B1 to B3: log the errors"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT replicator-errors {{ [b2_result.msg, b3_result.msg] | to_json }}"
+
+    - name: "B1 to B3: clear errors"
+      ansible.builtin.assert:
+        that:
+          - b1_result is failed
+          - b1_result.msg == 'config.cluster is required to create a replicator'
+          - b2_result is failed
+          - "'schedule' in b2_result.msg"
+          - b3_result is failed
+
+    - name: "RP2: promote the project on A to leader"
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        replica_mode: leader
+      register: rp2_result
+
+    - name: "I1: list the replicators of the project"
+      smcavoy.lxd.lxd_replicator_info:
+        project: "{{ proj }}"
+      register: i1_result
+
+    - name: "I2: one by name, with its state"
+      smcavoy.lxd.lxd_replicator_info:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        include_state: true
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_replicator_info:
+        project: "{{ proj }}"
+        name: no-such-replicator
+      register: i3_result
+
+    - name: "I4: all projects in check mode"
+      smcavoy.lxd.lxd_replicator_info:
+        all_projects: true
+        include_state: true
+      check_mode: true
+      register: i4_result
+
+    - name: "RP2 and I1 to I4: the leader promotion works, and the info module reads the replicator"
+      ansible.builtin.assert:
+        that:
+          - rp2_result is changed
+          - rp2_result.project.replica_mode == 'leader'
+          - i1_result is not changed
+          - i1_result.replicators | map(attribute='name') | list == [rep]
+          - i2_result.replicators | length == 1
+          - i2_result.replicators[0].state.status == 'Pending'
+          - i3_result.replicators == []
+          - i4_result is not changed
+          - (i4_result.replicators | selectattr('project', 'eq', proj) | map(attribute='name') | list) == [rep]
+
+    - name: Clear the replica mode of the project on A
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        replica_mode: ""
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the replicator"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ rep_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ rep }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.replicator is none
+          - c11_server.status == 404
+          - c12_result is not changed
+
+  always:
+    - name: Clear the replica mode of the project on A
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        replica_mode: ""
+      failed_when: false
+
+    - name: Remove the replicators
+      smcavoy.lxd.lxd_replicator:
+        project: "{{ proj }}"
+        name: "{{ item }}"
+        state: absent
+      loop: ["{{ rep }}", second]
+      failed_when: false
+
+    - name: Remove the project on A
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        state: absent
+      failed_when: false
+
+    - name: Clear the replica mode of the project on B
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        replica_mode: ""
+      failed_when: false
+
+    - name: Remove the project on B
+      smcavoy.lxd.lxd_project:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ proj }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the link on A
+      smcavoy.lxd.lxd_cluster_link:
+        name: "{{ link_a }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the link on B
+      smcavoy.lxd.lxd_cluster_link:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_b }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the auth group on A
+      smcavoy.lxd.lxd_auth_group:
+        name: "{{ link_group }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the auth group on B
+      smcavoy.lxd.lxd_auth_group:
+        url: "{{ peer.url }}"
+        server_cert: "{{ peer.server_cert }}"
+        name: "{{ link_group }}"
+        state: absent
+      failed_when: false

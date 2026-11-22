@@ -1,0 +1,182 @@
+# Goal: SC-BACKUP backs up an instance and its data volume to files, deletes both, and restores them from the files with the data intact.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-BACKUP backup and restore
+  hosts: localhost
+  gather_facts: false
+  vars:
+    bk_ct: "t-{{ lxd_run_id }}-bkct"
+    bk_vol: "t-{{ lxd_run_id }}-bkvol"
+    bk_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/sc-backup-{{ lxd_run_id }}"
+    bk_ct_file: "{{ bk_dir }}/instance.tar.gz"
+    bk_vol_file: "{{ bk_dir }}/volume.tar.gz"
+    bk_devices:
+      data:
+        type: disk
+        pool: "{{ lxd_pool }}"
+        source: "{{ bk_vol }}"
+        path: /data
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-BACKUP 1: make the folder for the backup files"
+          ansible.builtin.file:
+            path: "{{ bk_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: "SC-BACKUP 2: create the data volume"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ lxd_pool }}"
+            name: "{{ bk_vol }}"
+            description: SC-BACKUP data
+
+        - name: "SC-BACKUP 3: start a container with the volume on /data"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            config:
+              user.scenario: sc-backup
+            devices: "{{ bk_devices }}"
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-BACKUP 4: write a marker into the container"
+          smcavoy.lxd.lxd_instance_file:
+            instance: "{{ bk_ct }}"
+            path: /etc/backup-marker
+            content: "instance {{ lxd_run_id }}\n"
+
+        - name: "SC-BACKUP 4: write a marker onto the volume"
+          smcavoy.lxd.lxd_instance_file:
+            instance: "{{ bk_ct }}"
+            path: /data/marker
+            content: "volume {{ lxd_run_id }}\n"
+
+        - name: "SC-BACKUP 5: stop the container, so that the backups are consistent"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            state: stopped
+
+        - name: "SC-BACKUP 6: back up the container and download the file"
+          smcavoy.lxd.lxd_instance_backup:
+            instance: "{{ bk_ct }}"
+            name: sc-backup
+            compression_algorithm: gzip
+            dest: "{{ bk_ct_file }}"
+          register: sc_ct_backup
+
+        - name: "SC-BACKUP 6: back up the volume and download the file"
+          smcavoy.lxd.lxd_storage_volume_backup:
+            pool: "{{ lxd_pool }}"
+            volume: "{{ bk_vol }}"
+            name: sc-backup
+            compression_algorithm: gzip
+            dest: "{{ bk_vol_file }}"
+          register: sc_vol_backup
+
+        - name: "SC-BACKUP 7: delete the container with its backups"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            state: absent
+            force: true
+
+        - name: "SC-BACKUP 7: delete the volume with its backups"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ lxd_pool }}"
+            name: "{{ bk_vol }}"
+            state: absent
+
+        - name: "SC-BACKUP 8: restore the volume from its file"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ lxd_pool }}"
+            name: "{{ bk_vol }}"
+            source:
+              backup_path: "{{ bk_vol_file }}"
+          register: sc_vol_restore
+
+        - name: "SC-BACKUP 9: restore the container from its file and start it"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            source:
+              backup_path: "{{ bk_ct_file }}"
+            wait_for:
+              - type: ipv4
+          register: sc_ct_restore
+
+        - name: "SC-BACKUP 10: read the marker in the container"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ bk_ct }}"
+            command: [cat, /etc/backup-marker]
+          register: sc_ct_marker
+
+        - name: "SC-BACKUP 10: read the marker on the volume"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ bk_ct }}"
+            command: [cat, /data/marker]
+          register: sc_vol_marker
+
+        - name: "SC-BACKUP 11: run the restores again"
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ lxd_pool }}"
+            name: "{{ bk_vol }}"
+            source:
+              backup_path: "{{ bk_vol_file }}"
+          register: sc_vol_again
+
+        - name: "SC-BACKUP 11: run the container restore again"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            source:
+              backup_path: "{{ bk_ct_file }}"
+            config:
+              user.scenario: sc-backup
+            devices: "{{ bk_devices }}"
+          register: sc_ct_again
+
+        - name: "SC-BACKUP 11: the data is back, the config is back, and a second run makes no change"
+          ansible.builtin.assert:
+            that:
+              - sc_ct_backup is changed
+              - sc_ct_backup.size > 0
+              - sc_vol_backup is changed
+              - sc_vol_backup.size > 0
+              - sc_vol_restore is changed
+              - sc_vol_restore.storage_volume.description == 'SC-BACKUP data'
+              - sc_ct_restore is changed
+              - sc_ct_restore.instance.config['user.scenario'] == 'sc-backup'
+              - sc_ct_restore.instance.devices.data.source == bk_vol
+              - sc_ct_restore.instance.status == 'Running'
+              - sc_ct_marker.stdout == 'instance ' ~ lxd_run_id ~ '\n'
+              - sc_vol_marker.stdout == 'volume ' ~ lxd_run_id ~ '\n'
+              - sc_vol_again is not changed
+              - sc_ct_again is not changed
+      always:
+        - name: Remove the container
+          smcavoy.lxd.lxd_instance:
+            name: "{{ bk_ct }}"
+            state: absent
+            force: true
+          failed_when: false
+
+        - name: Remove the volume
+          smcavoy.lxd.lxd_storage_volume:
+            pool: "{{ lxd_pool }}"
+            name: "{{ bk_vol }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the backup files
+          ansible.builtin.file:
+            path: "{{ bk_dir }}"
+            state: absent

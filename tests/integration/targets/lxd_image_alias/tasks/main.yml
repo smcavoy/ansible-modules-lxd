@@ -1,0 +1,230 @@
+# Goal: lxd_image_alias creates, moves, and deletes aliases idempotently, accepts fingerprint prefixes, and keeps the image.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_image_alias tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    alias: "t-{{ lxd_run_id }}/alias"
+    alias_url: "{{ lxd_url }}/1.0/images/aliases/{{ alias | urlencode | replace('/', '%2F') }}"
+    ct: "t-{{ lxd_run_id }}-pub"
+  block:
+    - name: Read the test image
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/aliases/{{ lxd_image_ct | urlencode | replace('/', '%2F') }}"
+      register: base_alias
+
+    - name: Create a stopped container to publish a second image
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: stopped
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: Publish the container as a second image
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images"
+        method: POST
+        body:
+          source:
+            type: instance
+            name: "{{ ct }}"
+      register: publish
+
+    - name: Wait for the publish
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}{{ publish.json.operation }}/wait?timeout=300"
+      register: publish_wait
+
+    - name: Remember both fingerprints
+      ansible.builtin.set_fact:
+        fp_one: "{{ base_alias.json.metadata.target }}"
+        fp_two: "{{ publish_wait.json.metadata.metadata.fingerprint }}"
+
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_one }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ alias_url }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create the alias"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_one }}"
+        description: test alias
+      register: c2_result
+
+    - name: "C2: the module creates the alias"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.alias.target == fp_one
+          - c2_result.alias.type == 'container'
+          - c2_result.alias.description == 'test alias'
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_one }}"
+        description: test alias
+      register: c3_result
+
+    - name: "IA2: a fingerprint prefix"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_one[:12] }}"
+      register: ia2_result
+
+    - name: "C3 and IA2: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+          - ia2_result is not changed
+
+    - name: "C4: check mode predicts a move"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_two }}"
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ alias_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the move, and the server keeps the old target"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.target == fp_one
+          - c4_result.diff.after.target == fp_two
+          - c4_server.json.metadata.target == fp_one
+
+    - name: "C5 and IA1: move the alias to the second image"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "{{ fp_two }}"
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ alias_url }}"
+      register: c5_server
+
+    - name: "C5 and IA1: the alias points to the new image and keeps its description"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.target == fp_two
+          - c5_server.json.metadata.description == 'test alias'
+
+    - name: "C9: a target that does not exist"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'not found' in c9_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ alias_url }}"
+      register: c10_server
+
+    - name: "C10: the alias still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the alias"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the alias and the image"
+      ansible.builtin.uri:
+        url: "{{ item }}"
+      loop:
+        - "{{ alias_url }}"
+        - "{{ lxd_url }}/1.0/images/{{ fp_two }}"
+      register: c11_server
+
+    - name: "C11 and IA3: the module deletes the alias and keeps the image"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.alias is none
+          - c11_server.results[0].status == 404
+          - c11_server.results[1].status == 200
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the alias
+      smcavoy.lxd.lxd_image_alias:
+        name: "{{ alias }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the second image
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ fp_two }}"
+        method: DELETE
+      when: fp_two is defined
+      failed_when: false
+
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

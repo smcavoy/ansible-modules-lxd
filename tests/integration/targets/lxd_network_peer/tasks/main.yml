@@ -1,0 +1,215 @@
+# Goal: lxd_network_peer creates, updates, and deletes peers between OVN networks, and a mutual peer becomes Created.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_peer tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    net1: "t{{ lxd_run_id }}p1"
+    net2: "t{{ lxd_run_id }}p2"
+    peer_url: "{{ lxd_url }}/1.0/networks/{{ net1 }}/peers/to2"
+  block:
+    - name: Create two OVN networks
+      smcavoy.lxd.lxd_network:
+        name: "{{ item }}"
+        type: ovn
+        config:
+          network: "{{ lxd_ovn_uplink }}"
+      loop:
+        - "{{ net1 }}"
+        - "{{ net2 }}"
+
+    - name: "C1: check mode predicts a peer"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        target_network: "{{ net2 }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ peer_url }}"
+      register: c1_server
+
+    - name: "C2: create the peer"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        target_network: "{{ net2 }}"
+        description: one way
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        target_network: "{{ net2 }}"
+        description: one way
+      register: c3_result
+
+    - name: "C1 to C3: check mode does nothing, a one-way peer is pending, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.peer.target_network == net2
+          - c2_result.peer.status == 'Pending'
+          - c3_result is not changed
+
+    - name: "P1: create the peer back"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net2 }}"
+        name: to1
+        target_network: "{{ net1 }}"
+      register: p1_result
+
+    - name: "P1: read the first peer"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+      register: p1_first
+
+    - name: "P1: both peers are Created"
+      ansible.builtin.assert:
+        that:
+          - p1_result.peer.status == 'Created'
+          - p1_first is not changed
+          - p1_first.peer.status == 'Created'
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        description: both ways
+        config:
+          user.purpose: test
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5 and C6: update the description and add two keys"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        description: both ways
+        config:
+          user.purpose: test
+          user.extra: "1"
+      register: c6_result
+
+    - name: "C7: exact config removes user.extra"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        config:
+          user.purpose: test
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: run C7 again"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        config:
+          user.purpose: test
+        config_mode: exact
+      register: c8_result
+
+    - name: "B1: a different target network warns"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        target_network: other
+      register: b1_result
+
+    - name: "C4 to C8 and B1: check mode, update, exact mode, no change for a second run, and a warning"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.description == 'both ways'
+          - c6_result is changed
+          - c6_result.peer.description == 'both ways'
+          - c6_result.peer.config['user.extra'] == '1'
+          - c7_result is changed
+          - "'user.extra' not in c7_result.peer.config"
+          - c7_result.peer.description == 'both ways'
+          - c8_result is not changed
+          - b1_result is not changed
+          - b1_result.warnings | default([]) | select('search', 'target_network') | list | length == 1
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the peer"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ peer_url }}"
+      register: c11_server
+
+    - name: "C11: read the peer back"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net2 }}"
+        name: to1
+      register: c11_back
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net1 }}"
+        name: to2
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.peer is none
+          - c11_server.status == 404
+          - c12_result is not changed
+
+    - name: "C11: log the status of the peer back after the delete"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT peer-back-after-delete {{ c11_back.peer.status }}"
+  always:
+    - name: Remove the peer back
+      smcavoy.lxd.lxd_network_peer:
+        network: "{{ net2 }}"
+        name: to1
+        state: absent
+      failed_when: false
+
+    - name: Remove the networks
+      smcavoy.lxd.lxd_network:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ net1 }}"
+        - "{{ net2 }}"
+      failed_when: false

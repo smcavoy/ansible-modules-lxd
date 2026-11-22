@@ -1,0 +1,242 @@
+# Goal: lxd_cluster forms a cluster on a standalone server, joins two more servers with tokens, and removes a member, each idempotently.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_cluster tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    # Independent reads of member 1 over the REST API. Its certificate stays the same when it becomes the cluster certificate.
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+  block:
+    - name: "CL0: give member 1 a cluster address"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          cluster.https_address: "{{ lxd_member_ips[0] }}:8443"
+
+    - name: "CL0: read the cluster state from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster"
+        status_code: 200
+      register: cl0_server
+      retries: 3
+      delay: 2
+      until: cl0_server is not failed
+
+    - name: "CL1: enable clustering on member 1"
+      smcavoy.lxd.lxd_cluster:
+        server_name: "{{ lxd_members[0] }}"
+      register: cl1_result
+
+    - name: "CL1: trust the new cluster certificate in the next tasks"
+      ansible.builtin.copy:
+        content: "{{ cl1_result.certificate }}"
+        dest: "{{ lxd_server_cert }}"
+        mode: "0644"
+
+    - name: "CL1: read the cluster state from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster"
+        status_code: 200
+      register: cl1_server
+      retries: 3
+      delay: 2
+      until: cl1_server is not failed
+
+    - name: "CL1: read the server environment"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        status_code: 200
+      register: cl1_env
+      retries: 3
+      delay: 2
+      until: cl1_env is not failed
+
+    - name: "CL2: run CL1 again"
+      smcavoy.lxd.lxd_cluster:
+        server_name: "{{ lxd_members[0] }}"
+      register: cl2_result
+
+    - name: "B1: enable with another name"
+      smcavoy.lxd.lxd_cluster:
+        server_name: other-name
+      register: b1_result
+      ignore_errors: true
+
+    - name: "CL3: issue join tokens for members 2 and 3"
+      smcavoy.lxd.lxd_cluster_join_token:
+        name: "{{ item }}"
+      loop: "{{ lxd_members[1:] }}"
+      register: tokens
+      no_log: true
+
+    - name: "B2: a token that is not a join token"
+      smcavoy.lxd.lxd_cluster:
+        url: "{{ lxd_member_urls[2] }}"
+        server_cert: "{{ lxd_member_server_certs[2] }}"
+        state: joined
+        server_name: "{{ lxd_members[2] }}"
+        server_address: "{{ lxd_member_ips[2] }}:8443"
+        cluster_token: bm90IGEgdG9rZW4=
+      register: b2_result
+      ignore_errors: true
+
+    - name: "CL6: join member 3 in check mode"
+      smcavoy.lxd.lxd_cluster:
+        url: "{{ lxd_member_urls[2] }}"
+        server_cert: "{{ lxd_member_server_certs[2] }}"
+        state: joined
+        server_name: "{{ lxd_members[2] }}"
+        server_address: "{{ lxd_member_ips[2] }}:8443"
+        cluster_token: "{{ tokens.results[1].token }}"
+      check_mode: true
+      register: cl6_result
+      no_log: true
+
+    - name: "CL6: read the members"
+      smcavoy.lxd.lxd_cluster_member_info:
+      register: cl6_members
+
+    - name: "CL6: read the members from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members?recursion=1"
+        status_code: 200
+      register: cl6_server
+      retries: 3
+      delay: 2
+      until: cl6_server is not failed
+
+    - name: "CL3: join members 2 and 3"
+      smcavoy.lxd.lxd_cluster:
+        url: "{{ lxd_member_urls[index + 1] }}"
+        server_cert: "{{ lxd_member_server_certs[index + 1] }}"
+        state: joined
+        server_name: "{{ item }}"
+        server_address: "{{ lxd_member_ips[index + 1] }}:8443"
+        cluster_token: "{{ tokens.results[index].token }}"
+      loop: "{{ lxd_members[1:] }}"
+      loop_control:
+        index_var: index
+      register: cl3_result
+      no_log: true
+
+    - name: "CL3: read the members"
+      smcavoy.lxd.lxd_cluster_member_info:
+      register: cl3_members
+
+    - name: "CL3: read the members from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members?recursion=1"
+        status_code: 200
+      register: cl3_server
+      retries: 3
+      delay: 2
+      until: cl3_server is not failed
+
+    - name: "CL7: read the fingerprint of the cluster certificate"
+      smcavoy.lxd.lxd_server_info:
+      register: cluster_info
+
+    # Member 2 now presents the cluster certificate, which names member 1. So the task pins the certificate by its fingerprint.
+    - name: "CL7: join member 2 again"
+      smcavoy.lxd.lxd_cluster:
+        url: "{{ lxd_member_urls[1] }}"
+        server_fingerprint: "{{ cluster_info.server.environment.certificate_fingerprint }}"
+        state: joined
+        server_name: "{{ lxd_members[1] }}"
+        server_address: "{{ lxd_member_ips[1] }}:8443"
+        cluster_token: "{{ tokens.results[0].token }}"
+      register: cl7_result
+      no_log: true
+
+    - name: "CL8: a wrong fingerprint fails before any request"
+      smcavoy.lxd.lxd_server_info:
+        url: "{{ lxd_member_urls[1] }}"
+        server_fingerprint: "{{ '0' * 64 }}"
+      register: cl8_result
+      ignore_errors: true
+
+    - name: "CL4: remove member 3"
+      smcavoy.lxd.lxd_cluster:
+        state: absent
+        member: "{{ lxd_members[2] }}"
+      register: cl4_result
+
+    - name: "CL5: remove member 3 again"
+      smcavoy.lxd.lxd_cluster:
+        state: absent
+        member: "{{ lxd_members[2] }}"
+      register: cl5_result
+
+    - name: "CL4: read the members"
+      smcavoy.lxd.lxd_cluster_member_info:
+      register: cl4_members
+
+    - name: "CL4: read the members from the server"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members?recursion=1"
+        status_code: 200
+      register: cl4_server
+      retries: 3
+      delay: 2
+      until: cl4_server is not failed
+
+    - name: "CL4: the server does not know member 3 any more"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/cluster/members/{{ lxd_members[2] }}"
+        status_code: 404
+      register: cl4_gone
+      retries: 3
+      delay: 2
+      until: cl4_gone is not failed
+
+    - name: "CL1 to CL6: log the facts"
+      ansible.builtin.debug:
+        msg: >-
+          LXDTEST-FACT cluster cl1={{ cl1_result.cluster | to_json }}
+          cl3={{ cl3_members.members | map(attribute='server_name') | list | to_json }}
+          status={{ cl3_members.members | map(attribute='status') | list | to_json }}
+
+    - name: "CL1 to CL6 and B1 to B2: enable, join, remove, no change for a second run, and clear errors"
+      ansible.builtin.assert:
+        that:
+          - cl1_result is changed
+          - cl1_result.cluster.enabled
+          - cl1_result.cluster.server_name == lxd_members[0]
+          - cl1_result.certificate is search('BEGIN CERTIFICATE')
+          - cl2_result is not changed
+          - b1_result is failed
+          - "'does not rename' in b1_result.msg"
+          - b2_result is failed
+          - b2_result.msg == 'cluster_token is not a valid join token'
+          - cl6_result is changed
+          - cl6_members.members | length == 1
+          - cl3_result is changed
+          - cl3_result.results | map(attribute='cluster') | map(attribute='enabled') | list == [true, true]
+          - cl3_members.members | length == 3
+          - cl3_members.members | rejectattr('status', 'eq', 'Online') | list == []
+          - cl7_result is not changed
+          - cl7_result.cluster.server_name == lxd_members[1]
+          - cl8_result is failed
+          - "'not the server_fingerprint' in cl8_result.msg"
+          - cl4_result is changed
+          - cl4_members.members | length == 2
+          - cl5_result is not changed
+          - cl0_server.json.metadata.enabled is false
+          - cl1_server.json.metadata.enabled is true
+          - cl1_server.json.metadata.server_name == lxd_members[0]
+          - cl1_env.json.metadata.environment.server_clustered is true
+          - cl1_env.json.metadata.environment.server_name == lxd_members[0]
+          - cl6_server.json.metadata | map(attribute='server_name') | list == [lxd_members[0]]
+          - cl3_server.json.metadata | map(attribute='server_name') | sort == lxd_members | sort
+          - cl3_server.json.metadata | map(attribute='status') | unique | list == ['Online']
+          - cl4_server.json.metadata | map(attribute='server_name') | sort == lxd_members[:2] | sort

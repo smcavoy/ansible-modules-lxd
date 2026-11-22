@@ -1,0 +1,81 @@
+# Goal: lxd_server_config sets a member-specific key on one cluster member, idempotently.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_server_config_cluster tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  block:
+    - name: "SC4: set a metrics address on the second member"
+      smcavoy.lxd.lxd_server_config:
+        # Ansible does not template dictionary keys, so the key comes from a Jinja dictionary.
+        member_config: "{{ {lxd_members[1]: {'core.metrics_address': '[::]:9100'}} }}"
+      register: sc4_result
+
+    - name: "SC4: read the server on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: sc4_server
+      # LXD can reset a connection right after a change to its config.
+      until: sc4_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "SC4: only the second member has the key"
+      ansible.builtin.assert:
+        that:
+          - sc4_result is changed
+          - sc4_server.results[1].json.metadata.config['core.metrics_address'] == '[::]:9100'
+          - "'core.metrics_address' not in sc4_server.results[0].json.metadata.config"
+          - "'core.metrics_address' not in sc4_server.results[2].json.metadata.config"
+        fail_msg: "{{ sc4_server.results | map(attribute='json.metadata.config') | list | to_json }}"
+
+    - name: "SC5: run SC4 again"
+      smcavoy.lxd.lxd_server_config:
+        # Ansible does not template dictionary keys, so the key comes from a Jinja dictionary.
+        member_config: "{{ {lxd_members[1]: {'core.metrics_address': '[::]:9100'}} }}"
+      register: sc5_result
+
+    - name: "SC5: set a global key"
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.cluster_test: one
+      register: sc5_global
+
+    - name: "SC5: read the server on each member"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0?target={{ item }}"
+      loop: "{{ lxd_members }}"
+      register: sc5_server
+      until: sc5_server is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "SC5: a second run makes no change, a global key reaches all members, and the member key stays"
+      ansible.builtin.assert:
+        that:
+          - sc5_result is not changed
+          - sc5_global is changed
+          - sc5_server.results | map(attribute='json.metadata.config') | map('dict2items') | flatten
+            | selectattr('key', 'eq', 'user.cluster_test') | map(attribute='value') | list == ['one', 'one', 'one']
+          - sc5_server.results[1].json.metadata.config['core.metrics_address'] == '[::]:9100'
+  always:
+    - name: Remove the test keys
+      smcavoy.lxd.lxd_server_config:
+        config:
+          user.cluster_test: null
+        member_config: "{{ {lxd_members[1]: {'core.metrics_address': none}} }}"
+      failed_when: false

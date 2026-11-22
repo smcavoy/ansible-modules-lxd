@@ -1,0 +1,319 @@
+# Goal: SC-DR replicates a project to a second cluster, fails over to it, and restores the changes made there back to the first cluster.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-DR replication, failover and restore
+  hosts: localhost
+  gather_facts: false
+  vars:
+    link_a: "t-{{ lxd_run_id }}-dra"
+    link_b: "t-{{ lxd_run_id }}-drb"
+    proj: "t-{{ lxd_run_id }}-dr"
+    rep: to-b
+    ct: "t-{{ lxd_run_id }}-drct"
+    peer:
+      url: "{{ lxd_peer_url }}"
+      server_cert: "{{ lxd_peer_server_cert }}"
+    link_group: "t-{{ lxd_run_id }}-links"
+    link_permissions:
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: operator
+      - entity_type: project
+        url: "/1.0/projects/{{ proj }}"
+        entitlement: can_edit
+    # The project has its own profiles. Run 916 showed that a restore looks for the profile default in the project itself,
+    # also when features.profiles is false. So the container has its own root disk and NIC, and the empty default profile of the project is enough.
+    features:
+      features.images: "false"
+      features.profiles: "true"
+      features.storage.volumes: "false"
+      features.storage.buckets: "false"
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-DR 1: create the project on A"
+          smcavoy.lxd.lxd_project:
+            name: "{{ proj }}"
+            config: "{{ features }}"
+
+        - name: "SC-DR 1: create the project on B"
+          smcavoy.lxd.lxd_project:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ proj }}"
+            config: "{{ features }}"
+
+        - name: "SC-DR 1: let the cluster links work on the project of A"
+          smcavoy.lxd.lxd_auth_group:
+            name: "{{ link_group }}"
+            permissions: "{{ link_permissions }}"
+
+        - name: "SC-DR 1: let the cluster links work on the project of B"
+          smcavoy.lxd.lxd_auth_group:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ link_group }}"
+            permissions: "{{ link_permissions }}"
+
+        - name: "SC-DR 1: make a pending link on B"
+          smcavoy.lxd.lxd_cluster_link:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ link_b }}"
+            auth_groups: ["{{ link_group }}"]
+          register: pending
+          no_log: true
+
+        - name: "SC-DR 1: activate the link on A"
+          smcavoy.lxd.lxd_cluster_link:
+            name: "{{ link_a }}"
+            trust_token: "{{ pending.trust_token }}"
+            auth_groups: ["{{ link_group }}"]
+          no_log: true
+
+        - name: "SC-DR 1: point the project on A at B"
+          smcavoy.lxd.lxd_project:
+            name: "{{ proj }}"
+            config:
+              replica.cluster: "{{ link_a }}"
+
+        - name: "SC-DR 1: point the project on B at A, in standby mode"
+          smcavoy.lxd.lxd_project:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ proj }}"
+            config:
+              replica.cluster: "{{ link_b }}"
+            replica_mode: standby
+
+        - name: "SC-DR 5: create the replicator on A"
+          smcavoy.lxd.lxd_replicator:
+            project: "{{ proj }}"
+            name: "{{ rep }}"
+            config:
+              cluster: "{{ link_a }}"
+
+        - name: "SC-DR 6: promote the project on A to leader"
+          smcavoy.lxd.lxd_project:
+            name: "{{ proj }}"
+            replica_mode: leader
+
+        - name: "SC-DR 7: start a container on A and write a marker"
+          smcavoy.lxd.lxd_instance:
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices:
+              root:
+                type: disk
+                path: /
+                pool: default
+              eth0:
+                type: nic
+                network: lxdbr0
+                name: eth0
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-DR 8: write the first marker"
+          smcavoy.lxd.lxd_instance_exec:
+            project: "{{ proj }}"
+            instance: "{{ ct }}"
+            command: [sh, -c, "echo before {{ lxd_run_id }} > /root/before && sync"]
+
+        - name: "SC-DR 9: copy the project to B"
+          smcavoy.lxd.lxd_replicator_run:
+            project: "{{ proj }}"
+            name: "{{ rep }}"
+          register: sc_forward
+
+        - name: "SC-DR 10: fail over, step 1: stop the container on A"
+          smcavoy.lxd.lxd_instance:
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            state: stopped
+            force: true
+
+        - name: "SC-DR 11: fail over, step 2: demote the project on A"
+          smcavoy.lxd.lxd_project:
+            name: "{{ proj }}"
+            replica_mode: standby
+
+        - name: "SC-DR 12: fail over, step 3: promote the project on B"
+          smcavoy.lxd.lxd_project:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ proj }}"
+            replica_mode: leader
+
+        - name: "SC-DR 13: start the copy on B"
+          smcavoy.lxd.lxd_instance:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            state: started
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-DR 14: read the first marker on B, and write a second marker"
+          smcavoy.lxd.lxd_instance_exec:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            project: "{{ proj }}"
+            instance: "{{ ct }}"
+            command: [sh, -c, "cat /root/before && echo after {{ lxd_run_id }} > /root/after && sync"]
+          register: sc_on_b
+
+        - name: "SC-DR 15: stop the copy on B"
+          smcavoy.lxd.lxd_instance:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            state: stopped
+            force: true
+
+        - name: "SC-DR 16: restore the project on A from B"
+          smcavoy.lxd.lxd_replicator_run:
+            project: "{{ proj }}"
+            name: "{{ rep }}"
+            mode: restore
+          register: sc_restore
+          ignore_errors: true
+
+        - name: "SC-DR 16: read the failed operations on A after a failed restore"
+          when: sc_restore is failed
+          block:
+            - name: "SC-DR 16: read the failed operations"
+              smcavoy.lxd.lxd_operation_info:
+                all_projects: true
+                status: [Failure]
+                include_children: true
+              register: sc_failed_ops
+
+            - name: "SC-DR 16: read the failed operations on B"
+              smcavoy.lxd.lxd_operation_info:
+                url: "{{ peer.url }}"
+                server_cert: "{{ peer.server_cert }}"
+                all_projects: true
+                status: [Failure]
+                include_children: true
+              register: sc_failed_ops_b
+
+            - name: "SC-DR 16: log the failed operations"
+              ansible.builtin.debug:
+                msg: "LXDTEST-FACT sc-dr-restore-errors a={{ sc_failed_ops.operations | to_json }} b={{ sc_failed_ops_b.operations | to_json }}"
+
+            - name: "SC-DR 16: stop after a failed restore"
+              ansible.builtin.fail:
+                msg: "{{ sc_restore.msg }}"
+
+        - name: "SC-DR 17: fail back, step 1: demote the project on B"
+          smcavoy.lxd.lxd_project:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ proj }}"
+            replica_mode: standby
+
+        - name: "SC-DR 18: fail back, step 2: promote the project on A"
+          smcavoy.lxd.lxd_project:
+            name: "{{ proj }}"
+            replica_mode: leader
+
+        - name: "SC-DR 19: start the container on A"
+          smcavoy.lxd.lxd_instance:
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            state: started
+            wait_for:
+              - type: ipv4
+
+        - name: "SC-DR 20: read both markers on A"
+          smcavoy.lxd.lxd_instance_exec:
+            project: "{{ proj }}"
+            instance: "{{ ct }}"
+            command: [cat, /root/before, /root/after]
+          register: sc_on_a
+
+        - name: "SC-DR 21: the copy on B has the first marker, and after the restore A has both markers"
+          ansible.builtin.assert:
+            that:
+              - sc_forward.status == 'Completed'
+              - sc_on_b.stdout == 'before ' ~ lxd_run_id ~ '\n'
+              - sc_restore.status == 'Completed'
+              - sc_on_a.stdout_lines == ['before ' ~ lxd_run_id, 'after ' ~ lxd_run_id]
+      always:
+        - name: Clear the replica modes
+          smcavoy.lxd.lxd_project:
+            url: "{{ item }}"
+            server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+            name: "{{ proj }}"
+            replica_mode: ""
+          loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+          failed_when: false
+
+        - name: Remove the containers
+          smcavoy.lxd.lxd_instance:
+            url: "{{ item }}"
+            server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+            project: "{{ proj }}"
+            name: "{{ ct }}"
+            state: absent
+            force: true
+          loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+          failed_when: false
+
+        - name: Remove the replicator
+          smcavoy.lxd.lxd_replicator:
+            project: "{{ proj }}"
+            name: "{{ rep }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the projects
+          smcavoy.lxd.lxd_project:
+            url: "{{ item }}"
+            server_cert: "{{ lxd_server_cert if item == lxd_url else peer.server_cert }}"
+            name: "{{ proj }}"
+            state: absent
+          loop: ["{{ lxd_url }}", "{{ peer.url }}"]
+          failed_when: false
+
+        - name: Remove the link on A
+          smcavoy.lxd.lxd_cluster_link:
+            name: "{{ link_a }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the link on B
+          smcavoy.lxd.lxd_cluster_link:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ link_b }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the auth group on A
+          smcavoy.lxd.lxd_auth_group:
+            name: "{{ link_group }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the auth group on B
+          smcavoy.lxd.lxd_auth_group:
+            url: "{{ peer.url }}"
+            server_cert: "{{ peer.server_cert }}"
+            name: "{{ link_group }}"
+            state: absent
+          failed_when: false

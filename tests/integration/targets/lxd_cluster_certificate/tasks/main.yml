@@ -1,0 +1,146 @@
+# Goal: lxd_cluster_certificate replaces the cluster certificate once, makes no change on a second run, and refuses a key that does not match.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# This target changes the certificate of the cluster. It writes the new certificate into the file of lxd_server_cert,
+# so that the next tests of the slot trust the new certificate.
+- name: Run the lxd_cluster_certificate tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+    # Independent reads over the REST API. ca_path makes uri accept only a server that presents the certificate in that file.
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      body_format: json
+  vars:
+    openssl_fingerprint: "{{ new_fp.stdout | lower | regex_replace('^.*=', '') | replace(':', '') }}"
+  block:
+    - name: Make a folder for the certificates
+      ansible.builtin.tempfile:
+        state: directory
+      register: cert_dir
+
+    - name: Make a new certificate for the address of member 1, and a second key
+      ansible.builtin.shell:
+        cmd: >-
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 30
+          -subj /CN=t-{{ lxd_run_id }}-cluster -addext "subjectAltName=DNS:{{ lxd_sandbox_name }},IP:{{ lxd_sandbox_ip }}"
+          -keyout new.key -out new.crt
+          && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out other.key
+        chdir: "{{ cert_dir.path }}"
+      changed_when: true
+
+    - name: Keep a copy of the old certificate
+      ansible.builtin.copy:
+        src: "{{ lxd_server_cert }}"
+        dest: "{{ cert_dir.path }}/old.crt"
+        mode: "0600"
+
+    - name: Compute the fingerprint of the new certificate
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "{{ cert_dir.path }}/new.crt", -noout, -fingerprint, -sha256]
+      changed_when: false
+      register: new_fp
+
+    - name: "CC3: a key that does not match"
+      smcavoy.lxd.lxd_cluster_certificate:
+        server_cert: "{{ lxd_server_cert }}"
+        certificate: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.crt') }}"
+        key: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/other.key') }}"
+      register: cc3_result
+      ignore_errors: true
+
+    - name: "CC0: check mode predicts a change"
+      smcavoy.lxd.lxd_cluster_certificate:
+        server_cert: "{{ lxd_server_cert }}"
+        certificate: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.crt') }}"
+        key: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.key') }}"
+      check_mode: true
+      register: cc0_result
+
+    - name: "CC0 and CC3: read the server, which must still present the old certificate"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ cert_dir.path }}/old.crt"
+        status_code: 200
+      register: cc0_server
+      retries: 3
+      delay: 2
+      until: cc0_server is not failed
+
+    - name: "CC1: install the new certificate"
+      smcavoy.lxd.lxd_cluster_certificate:
+        server_cert: "{{ lxd_server_cert }}"
+        certificate: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.crt') }}"
+        key: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.key') }}"
+      register: cc1_result
+
+    - name: "CC1: trust the new certificate in the next tests"
+      ansible.builtin.copy:
+        src: "{{ cert_dir.path }}/new.crt"
+        dest: "{{ lxd_server_cert }}"
+        mode: "0644"
+
+    - name: "CC1: read the server with the new certificate"
+      smcavoy.lxd.lxd_server_info:
+        server_cert: "{{ lxd_server_cert }}"
+      register: cc1_server
+
+    - name: "CC1: read the server, which must present the new certificate"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ cert_dir.path }}/new.crt"
+        status_code: 200
+      register: cc1_uri
+      retries: 3
+      delay: 2
+      until: cc1_uri is not failed
+
+    - name: "CC1: the old certificate is not accepted any more"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+        ca_path: "{{ cert_dir.path }}/old.crt"
+        status_code: 200
+      register: cc1_old
+      retries: 3
+      delay: 2
+      until: "'CERTIFICATE_VERIFY_FAILED' in cc1_old.msg | default('')"
+      ignore_errors: true
+
+    - name: "CC2: run CC1 again"
+      smcavoy.lxd.lxd_cluster_certificate:
+        server_cert: "{{ lxd_server_cert }}"
+        certificate: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.crt') }}"
+        key: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/new.key') }}"
+      register: cc2_result
+
+    - name: "CC0 to CC3: check mode does nothing, the new certificate works, a second run makes no change, and a wrong key fails"
+      ansible.builtin.assert:
+        that:
+          - cc3_result is failed
+          - "'does not match' in cc3_result.msg"
+          - cc0_result is changed
+          - cc0_result.fingerprint == cc1_result.fingerprint
+          - cc1_result is changed
+          - cc1_result.previous_fingerprint == cc0_result.previous_fingerprint
+          - cc1_result.fingerprint != cc1_result.previous_fingerprint
+          - cc1_server.server.environment.certificate_fingerprint == cc1_result.fingerprint
+          - cc2_result is not changed
+          - cc0_server.json.metadata.environment.certificate_fingerprint == cc1_result.previous_fingerprint
+          - cc0_server.json.metadata.environment.certificate_fingerprint != openssl_fingerprint
+          - cc1_result.fingerprint == openssl_fingerprint
+          - cc1_uri.json.metadata.environment.certificate_fingerprint == openssl_fingerprint
+          - cc1_uri.json.metadata.environment.certificate | trim == lookup('ansible.builtin.file', cert_dir.path ~ '/new.crt') | trim
+          - cc1_old is failed
+          - "'CERTIFICATE_VERIFY_FAILED' in cc1_old.msg"
+  always:
+    - name: Remove the folder
+      ansible.builtin.file:
+        path: "{{ cert_dir.path }}"
+        state: absent
+      when: cert_dir.path is defined

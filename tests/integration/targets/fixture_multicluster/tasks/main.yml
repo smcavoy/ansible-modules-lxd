@@ -1,0 +1,35 @@
+# Goal: the multicluster fixture gives two reachable single-member clusters with the cluster link extensions.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the multicluster fixture checks
+  module_defaults:
+    smcavoy.lxd.lxd_server_info:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+  block:
+    - name: "F1: read cluster A"
+      smcavoy.lxd.lxd_server_info:
+        url: "{{ lxd_url }}"
+        server_cert: "{{ lxd_server_cert }}"
+      register: f1_a
+
+    - name: "F1: read cluster B"
+      smcavoy.lxd.lxd_server_info:
+        url: "{{ lxd_peer_url }}"
+        server_cert: "{{ lxd_peer_server_cert }}"
+      register: f1_b
+
+    - name: "F1: both servers are clusters, with different certificates"
+      ansible.builtin.assert:
+        that:
+          - f1_a.server.environment.server_clustered is true
+          - f1_b.server.environment.server_clustered is true
+          - f1_a.server.environment.certificate_fingerprint != f1_b.server.environment.certificate_fingerprint
+          - "'cluster_links' in f1_a.server.api_extensions"
+
+    - name: "F2: log the cluster link extensions"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT extensions {{ f1_a.server.api_extensions | select('search', 'cluster_link|replicator') | list | to_json }}"

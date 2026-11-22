@@ -1,0 +1,232 @@
+# Goal: lxd_instance_device adds, changes, and removes one device, keeps other devices, and leaves profiles alone.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_device tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    ct: "t-{{ lxd_run_id }}-dev"
+    prof: "t-{{ lxd_run_id }}-devprof"
+    ct_url: "{{ lxd_url }}/1.0/instances/{{ ct }}"
+    proxy:
+      type: proxy
+      listen: tcp:0.0.0.0:8080
+      connect: tcp:127.0.0.1:80
+  block:
+    - name: Create a profile with a disk device named shared
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        devices:
+          shared:
+            type: disk
+            source: /tmp
+            path: /mnt/profile
+
+    - name: Start a container with the profile
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        profiles: [default, "{{ prof }}"]
+        source:
+          image: "{{ lxd_image_ct }}"
+        # Right after the start, an exec can fail with "Command not found". The address also means that the web server can listen.
+        wait_for:
+          - type: ipv4
+
+    - name: Start a web server in the container
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        # Alpine busybox has no httpd applet. The nc applet serves the page, as in SC-WEB.
+        command:
+          - sh
+          - -c
+          - >-
+            (while true; do printf 'HTTP/1.0 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndevice-test\n' | nc -l -p 80; done)
+            >/dev/null 2>&1 &
+
+    - name: "C1: check mode predicts a new device"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        properties: "{{ proxy }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the instance"
+      ansible.builtin.uri:
+        url: "{{ ct_url }}"
+      register: c1_server
+
+    - name: "C2: add the proxy device"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        properties: "{{ proxy }}"
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        properties: "{{ proxy }}"
+      register: c3_result
+
+    - name: "DV1: fetch the page through the proxy"
+      ansible.builtin.uri:
+        url: "http://{{ lxd_sandbox_ip }}:8080/"
+        return_content: true
+      register: dv1_page
+      until: dv1_page.status == 200
+      retries: 5
+      delay: 2
+
+    - name: "C1 to C3 and DV1: check mode, add, no change, and the proxy forwards the port"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - "'http' not in c1_server.json.metadata.devices"
+          - c2_result is changed
+          - c2_result.device.listen == 'tcp:0.0.0.0:8080'
+          - c3_result is not changed
+          - dv1_page.content == 'device-test\n'
+
+    - name: "DV2: another task adds a second device"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: scratch
+        properties:
+          type: disk
+          source: /tmp
+          path: /mnt/scratch
+
+    - name: "C4: check mode predicts a change"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        properties: "{{ proxy | combine({'listen': 'tcp:0.0.0.0:8081'}) }}"
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5: change the listen port"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        properties: "{{ proxy | combine({'listen': 'tcp:0.0.0.0:8081'}) }}"
+      register: c5_result
+
+    - name: "DV3: an instance device with the name of a profile device"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: shared
+        properties:
+          type: disk
+          source: /tmp
+          path: /mnt/instance
+
+    - name: "C5, DV2, and DV3: read the instance and the profile"
+      ansible.builtin.uri:
+        url: "{{ item }}"
+      loop:
+        - "{{ ct_url }}"
+        - "{{ lxd_url }}/1.0/profiles/{{ prof }}"
+      register: c5_server
+
+    - name: "C4, C5, DV2, and DV3: the diff, the change, the other device stays, and the profile stays"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.device.listen == 'tcp:0.0.0.0:8080'
+          - c4_result.diff.after.device.listen == 'tcp:0.0.0.0:8081'
+          - c5_result is changed
+          - c5_server.results[0].json.metadata.devices.http.listen == 'tcp:0.0.0.0:8081'
+          - c5_server.results[0].json.metadata.devices.scratch.path == '/mnt/scratch'
+          - c5_server.results[0].json.metadata.devices.shared.path == '/mnt/instance'
+          - c5_server.results[1].json.metadata.devices.shared.path == '/mnt/profile'
+
+    - name: "C9: properties without a type"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: broken
+        properties:
+          path: /x
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: a missing instance"
+      smcavoy.lxd.lxd_instance_device:
+        instance: no-such-instance
+        name: http
+        properties: "{{ proxy }}"
+      register: c9_missing
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'needs type' in c9_result.msg"
+          - c9_missing is failed
+          - "'not found' in c9_missing.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the device"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the instance"
+      ansible.builtin.uri:
+        url: "{{ ct_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_instance_device:
+        instance: "{{ ct }}"
+        name: http
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.device is none
+          - "'http' not in c11_server.json.metadata.devices"
+          - c11_server.json.metadata.devices.scratch is defined
+          - c12_result is not changed
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false
+
+    - name: Remove the profile
+      smcavoy.lxd.lxd_profile:
+        name: "{{ prof }}"
+        state: absent
+      failed_when: false

@@ -1,0 +1,450 @@
+# Goal: lxd_image uploads and publishes images, manages properties and aliases idempotently, and deletes images.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_image tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    # The upload goes into its own project, because the default image store already holds the same Alpine image.
+    proj: "t-{{ lxd_run_id }}-img"
+    up_alias: up/alpine
+    ct: "t-{{ lxd_run_id }}-imgpub"
+    pub_alias: "t-{{ lxd_run_id }}/published"
+    upload:
+      metadata_path: "{{ lxd_image_ct_meta }}"
+      rootfs_path: "{{ lxd_image_ct_rootfs }}"
+  block:
+    - name: Create a project with its own image store
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        config:
+          features.images: true
+
+    - name: "C1: check mode predicts an upload"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        source: "{{ upload }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the images of the project"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images?project={{ proj }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create and uploads nothing"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_result.image.fingerprint == 'unknown'
+          - c1_server.json.metadata == []
+
+    - name: "C2: upload the split image"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+            description: uploaded
+        properties:
+          purpose: test
+        source: "{{ upload }}"
+      register: c2_result
+
+    - name: "C2: the module uploads the image with the alias and the property"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.image.type == 'container'
+          - c2_result.image.properties.purpose == 'test'
+          - c2_result.image.aliases | map(attribute='name') | list == [up_alias]
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+            description: uploaded
+        properties:
+          purpose: test
+        source: "{{ upload }}"
+      register: c3_result
+
+    - name: "C3: a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts a property change"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        properties:
+          purpose: changed
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the image"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ c2_result.image.fingerprint }}?project={{ proj }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the property, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.properties.purpose == 'test'
+          - c4_result.diff.after.properties.purpose == 'changed'
+          - c4_server.json.metadata.properties.purpose == 'test'
+
+    - name: "C5: change the property by fingerprint prefix"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        fingerprint: "{{ c2_result.image.fingerprint[:12] }}"
+        properties:
+          purpose: changed
+      register: c5_result
+
+    - name: "C5: the module changes the property"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_result.image.properties.purpose == 'changed'
+          - c5_result.image.aliases | length == 1
+
+    - name: "C6: read the image before the API change"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ c2_result.image.fingerprint }}?project={{ proj }}"
+      register: c6_before
+
+    - name: "C6: add a property with the API"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ c2_result.image.fingerprint }}?project={{ proj }}"
+        method: PUT
+        body:
+          auto_update: "{{ c6_before.json.metadata.auto_update }}"
+          public: "{{ c6_before.json.metadata.public }}"
+          profiles: "{{ c6_before.json.metadata.profiles }}"
+          expires_at: "{{ c6_before.json.metadata.expires_at }}"
+          properties: "{{ c6_before.json.metadata.properties | combine({'other': 'set-by-api'}) }}"
+
+    - name: "C6: run without the property in merge mode"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        properties:
+          purpose: changed
+      register: c6_result
+
+    - name: "C6: merge keeps properties that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_result.image.properties.other == 'set-by-api'
+
+    - name: "C7: run with properties_mode exact"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        properties:
+          purpose: changed
+        properties_mode: exact
+      register: c7_result
+
+    - name: "C7: exact removes the other properties"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "c7_result.image.properties == {'purpose': 'changed'}"
+
+    - name: "C8: remove the property with null"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        properties:
+          purpose: null
+      register: c8_result
+
+    - name: "C8: null removes the property"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'purpose' not in c8_result.image.properties"
+
+    - name: "IM4: add a second alias"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+          - name: up/second
+      register: im4_add
+
+    - name: "IM4: keep only the first alias with aliases_mode exact"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        aliases_mode: exact
+      register: im4_exact
+
+    - name: "IM4: read the second alias"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/aliases/up%2Fsecond?project={{ proj }}"
+      register: im4_server
+
+    - name: "IM4: exact removes the extra alias"
+      ansible.builtin.assert:
+        that:
+          - im4_add is changed
+          - im4_exact is changed
+          - im4_server.status == 404
+
+    - name: "IM5: public in a project other than default"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        public: true
+      register: im5_result
+      ignore_errors: true
+
+    - name: "C9: an image that does not exist, without a source"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: no/such/image
+      register: c9_result
+      ignore_errors: true
+
+    - name: "IM5 and C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - im5_result is failed
+          - "'default project' in im5_result.msg"
+          - c9_result is failed
+          - "'no source given' in c9_result.msg"
+
+    - name: "IM3: create a stopped container"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: stopped
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: "IM3: publish the container"
+      smcavoy.lxd.lxd_image:
+        aliases:
+          - name: "{{ pub_alias }}"
+        properties:
+          os: Alpine
+        source:
+          instance: "{{ ct }}"
+      register: im3_result
+
+    - name: "IM3: publish again"
+      smcavoy.lxd.lxd_image:
+        aliases:
+          - name: "{{ pub_alias }}"
+        properties:
+          os: Alpine
+        source:
+          instance: "{{ ct }}"
+      register: im3_again
+
+    - name: "IM3: a new image exists with the alias, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - im3_result is changed
+          - im3_result.image.aliases | map(attribute='name') | list == [pub_alias]
+          - im3_result.image.fingerprint != c2_result.image.fingerprint
+          - im3_again is not changed
+
+    - name: "IM1: make a temporary file for the unified tarball"
+      ansible.builtin.tempfile:
+        suffix: .tar.gz
+      register: im1_file
+
+    # A container publish gives a unified image. Its export is one tarball, not a multipart body.
+    - name: "IM1: export the published image"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ im3_result.image.fingerprint }}/export"
+        dest: "{{ im1_file.path }}"
+        force: true
+      register: im1_export
+      # LXD sometimes resets a connection right after a change. A read is safe to repeat.
+      until: im1_export is succeeded
+      retries: 3
+      delay: 2
+
+    - name: "IM1: upload the unified tarball into the test project"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: up/unified
+        source:
+          path: "{{ im1_file.path }}"
+      register: im1_result
+
+    - name: "IM1: the upload has the fingerprint of the published image"
+      ansible.builtin.assert:
+        that:
+          - not (im1_export.content_type | default('')).startswith('multipart/')
+          - im1_result is changed
+          - im1_result.image.fingerprint == im3_result.image.fingerprint
+
+    - name: "IM2: upload the split VM image into the test project"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: up/vm
+        source:
+          metadata_path: "{{ lxd_image_vm_meta }}"
+          rootfs_path: "{{ lxd_image_vm_rootfs }}"
+          image_type: virtual-machine
+      register: im2_result
+
+    - name: "IM2: the image is a VM image"
+      ansible.builtin.assert:
+        that:
+          - im2_result is changed
+          - im2_result.image.type == 'virtual-machine'
+
+    # IM6 needs internet. The sandbox reaches it through the NAT of the CI bridge.
+    - name: "IM6: copy Alpine from the images registry into the test project"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: up/registry
+        source:
+          image_registry: images
+          alias: alpine/3.22
+          image_type: container
+      register: im6_result
+
+    - name: "IM6: run the copy again"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: up/registry
+        source:
+          image_registry: images
+          alias: alpine/3.22
+      register: im6_again
+
+    - name: "IM6: the image comes from the registry, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - im6_result is changed
+          - im6_result.image.type == 'container'
+          - im6_again is not changed
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the image"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ c2_result.image.fingerprint }}?project={{ proj }}"
+      register: c10_server
+
+    - name: "C10: the image still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the image"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the image"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/images/{{ c2_result.image.fingerprint }}?project={{ proj }}"
+      register: c11_server
+
+    - name: "C11: the module deletes the image"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.image is none
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ up_alias }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the published image
+      smcavoy.lxd.lxd_image:
+        aliases:
+          - name: "{{ pub_alias }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the images of the test project
+      smcavoy.lxd.lxd_image:
+        project: "{{ proj }}"
+        aliases:
+          - name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ up_alias }}"
+        - up/unified
+        - up/vm
+        - up/registry
+      failed_when: false
+
+    - name: Remove the unified tarball
+      ansible.builtin.file:
+        path: "{{ im1_file.path }}"
+        state: absent
+      when: im1_file.path is defined
+
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false
+
+    - name: Remove the project
+      smcavoy.lxd.lxd_project:
+        name: "{{ proj }}"
+        state: absent
+      failed_when: false

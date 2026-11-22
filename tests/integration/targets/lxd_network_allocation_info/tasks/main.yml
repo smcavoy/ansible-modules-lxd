@@ -1,0 +1,72 @@
+# Goal: lxd_network_allocation_info lists the addresses in use, and filters them by network and type.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_allocation_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-alloc"
+  block:
+    - name: Start a container on the default network
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        wait_for:
+          - type: ipv4
+
+    - name: "I1 and AL1: list all allocations"
+      smcavoy.lxd.lxd_network_allocation_info:
+      register: i1_result
+
+    - name: "AL2: only the allocations of lxdbr0"
+      smcavoy.lxd.lxd_network_allocation_info:
+        network: lxdbr0
+      register: al2_result
+
+    - name: "AL2: only the instance allocations"
+      smcavoy.lxd.lxd_network_allocation_info:
+        type: instance
+      register: al2_type
+
+    - name: "I3 and AL3: a missing network"
+      smcavoy.lxd.lxd_network_allocation_info:
+        network: no-such-network
+      register: i3_result
+
+    - name: "I4: all projects in check mode"
+      smcavoy.lxd.lxd_network_allocation_info:
+        all_projects: true
+      check_mode: true
+      register: i4_result
+
+    - name: "I1: log the allocations"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT allocations {{ i1_result.allocations | to_json }}"
+
+    - name: "I1 to I4 and AL1 to AL3: the container has an allocation, and the filters work"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - i1_result.allocations | selectattr('used_by', 'search', '/instances/' ~ ct ~ '$') | list | length > 0
+          - al2_result.allocations | length > 0
+          - al2_result.allocations | rejectattr('network', 'eq', 'lxdbr0') | list == []
+          - al2_type.allocations | rejectattr('type', 'eq', 'instance') | list == []
+          - al2_type.allocations | length > 0
+          - i3_result is not changed
+          - i3_result.allocations == []
+          - i4_result.allocations | length >= i1_result.allocations | length
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

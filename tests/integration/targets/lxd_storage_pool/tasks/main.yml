@@ -1,0 +1,321 @@
+# Goal: lxd_storage_pool creates, updates, and deletes a dir pool idempotently, and keeps computed keys.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_storage_pool tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    pool: "t-{{ lxd_run_id }}-pool"
+    pool_url: "{{ lxd_url }}/1.0/storage-pools/{{ pool }}"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+
+    - name: "C2: create the pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+        description: test pool
+        config:
+          rsync.bwlimit: 10MB
+      register: c2_result
+
+    - name: "C2: the module creates the pool"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.storage_pool.status == 'Created'
+          - c2_result.storage_pool.driver == 'dir'
+          - c2_result.storage_pool.description == 'test pool'
+          - c2_result.storage_pool.config['rsync.bwlimit'] == '10MB'
+          - c2_result.storage_pool.config.source is defined
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: dir
+        description: test pool
+        config:
+          rsync.bwlimit: 10MB
+      register: c3_result
+
+    - name: "C3: a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the option, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.config['rsync.bwlimit'] == '10MB'
+          - c4_result.diff.after.config['rsync.bwlimit'] == '20MB'
+          - c4_server.json.metadata.config['rsync.bwlimit'] == '10MB'
+
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c5_server
+
+    - name: "C5: the module updates the option"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config['rsync.bwlimit'] == '20MB'
+          - c5_server.json.metadata.description == 'test pool'
+
+    - name: "C6: read the pool before the API change"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c6_before
+
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+        method: PATCH
+        body:
+          description: "{{ c6_before.json.metadata.description }}"
+          config:
+            user.other: set-by-api
+
+    - name: "C6: run without the key in merge mode"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+      register: c6_result
+
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c6_server
+
+    - name: "C6: merge keeps keys that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+        config_mode: exact
+      register: c7_result
+
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c7_server
+
+    - name: "C7 and S2: exact removes unmanaged keys and keeps the computed key source"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+          - c7_server.json.metadata.config.source == c6_server.json.metadata.config.source
+
+    - name: "S2: run exact again"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: 20MB
+        config_mode: exact
+      register: s2_result
+
+    - name: "S2: the computed key causes no change"
+      ansible.builtin.assert:
+        that:
+          - s2_result is not changed
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        config:
+          rsync.bwlimit: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c8_server
+
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'rsync.bwlimit' not in c8_server.json.metadata.config"
+
+    - name: "S1: another driver on an existing pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        driver: zfs
+      register: s1_result
+
+    - name: "S1: the module warns and makes no change"
+      ansible.builtin.assert:
+        that:
+          - s1_result is not changed
+          - s1_result.warnings | default([]) | select('search', 'driver') | list | length == 1
+
+    - name: "C9: create without a driver"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}-none"
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'driver is required' in c9_result.msg"
+
+    - name: "S3: read the drivers that the server offers"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0"
+      register: s3_server
+      # LXD sometimes resets a connection during a read. A read is safe to repeat.
+      until: s3_server is succeeded
+      retries: 3
+      delay: 2
+
+    # LXD lists some drivers, such as pure, even without the hardware. So S3 uses a driver that is not in the list.
+    - name: "S3: find a driver that the server does not offer"
+      ansible.builtin.set_fact:
+        s3_missing: >-
+          {{ ['dir', 'zfs', 'btrfs', 'lvm', 'ceph', 'cephfs', 'cephobject', 'powerflex', 'pure', 'powerstore', 'alletra']
+             | difference(s3_server.json.metadata.environment.storage_supported_drivers | map(attribute='Name') | list) }}
+
+    # LXD 6.10 offers every driver of the module. S3 then uses a name that no LXD has, and the module refuses the
+    # name itself, before it asks the server. So S3 always runs, and always checks a refusal and the server.
+    # A unit test in tests/unit/plugins/modules/test_config_resources.py covers the "not available" check of the module.
+    - name: "S3: choose the driver, and the message that the module must give"
+      ansible.builtin.set_fact:
+        s3_driver: "{{ s3_missing | first | default('lxdt-no-such-driver') }}"
+        s3_message: "{{ 'not available' if s3_missing | length > 0 else 'value of driver must be one of' }}"
+
+    - name: "S3: a driver that the server does not offer, or that no LXD has"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}-missing"
+        driver: "{{ s3_driver }}"
+      register: s3_result
+      ignore_errors: true
+
+    - name: "S3: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}-missing"
+      register: s3_pool
+
+    - name: "S3: the module fails early, and the server has no such pool"
+      ansible.builtin.assert:
+        that:
+          - s3_result is failed
+          - s3_message in s3_result.msg
+          - s3_pool.status == 404
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c10_server
+
+    - name: "C10: the pool still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the pool"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c11_server
+
+    - name: "C11: the module deletes the pool"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.storage_pool is none
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ pool }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test pools
+      smcavoy.lxd.lxd_storage_pool:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ pool }}"
+        - "{{ pool }}-none"
+        - "{{ pool }}-missing"
+      failed_when: false

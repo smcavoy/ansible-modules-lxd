@@ -1,0 +1,30 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+namespace: smcavoy
+name: lxd
+version: 0.1.3
+readme: README.md
+authors:
+  - Sean McAvoy
+description: Modules to manage LXD 6.10.1 or newer through its REST API.
+license_file: COPYING
+tags:
+  - lxd
+  - containers
+  - virtualization
+  - cloud
+dependencies: {}
+repository: https://github.com/smcavoy/ansible-modules-lxd
+homepage: https://github.com/smcavoy/ansible-modules-lxd
+issues: https://github.com/smcavoy/ansible-modules-lxd/issues
+build_ignore:
+  - AGENTS.md
+  - .github
+  - .gitleaks.toml
+  - ci
+  - docs/design
+  - changelogs/fragments
+  - tests/output
+  - "*.tar.gz"

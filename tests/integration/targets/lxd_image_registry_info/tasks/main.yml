@@ -1,0 +1,65 @@
+# Goal: lxd_image_registry_info lists registries, reads one, and gives an empty list for a missing name.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_image_registry_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  block:
+    - name: Create a test registry
+      smcavoy.lxd.lxd_image_registry:
+        name: "t-{{ lxd_run_id }}-ri"
+        config:
+          url: https://images.example.invalid
+
+    - name: "I1 and IRI1: list all"
+      smcavoy.lxd.lxd_image_registry_info:
+      register: i1_result
+
+    - name: "I2: one by name"
+      smcavoy.lxd.lxd_image_registry_info:
+        name: "t-{{ lxd_run_id }}-ri"
+      register: i2_result
+
+    - name: "I3: a missing name"
+      smcavoy.lxd.lxd_image_registry_info:
+        name: no-such-registry
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_image_registry_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "I5: include_images without a name"
+      smcavoy.lxd.lxd_image_registry_info:
+        include_images: true
+      register: i5_result
+      ignore_errors: true
+
+    - name: "I1 to I5 and IRI1: the built-in registries, the test registry, and the rules"
+      ansible.builtin.assert:
+        that:
+          - i1_result is not changed
+          - i1_result.image_registries | selectattr('builtin') | map(attribute='name') | sort
+            == ['images', 'ubuntu', 'ubuntu-daily', 'ubuntu-minimal', 'ubuntu-minimal-daily']
+          - ('t-' ~ lxd_run_id ~ '-ri') in (i1_result.image_registries | map(attribute='name') | list)
+          - i2_result.image_registries | length == 1
+          - i2_result.image_registries[0].builtin is false
+          - i3_result.image_registries == []
+          - i4_result is not changed
+          - i4_result.image_registries | length == i1_result.image_registries | length
+          - i5_result is failed
+          - "'needs name' in i5_result.msg"
+  always:
+    - name: Remove the test registry
+      smcavoy.lxd.lxd_image_registry:
+        name: "t-{{ lxd_run_id }}-ri"
+        state: absent
+      failed_when: false

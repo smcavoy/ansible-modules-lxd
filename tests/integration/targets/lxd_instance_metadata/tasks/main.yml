@@ -1,0 +1,141 @@
+# Goal: lxd_instance_metadata sets properties and templates, a copy renders the template, a second run makes no change, and exact mode removes other templates.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_metadata tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+  vars:
+    golden: "t-{{ lxd_run_id }}-golden"
+    copy: "t-{{ lxd_run_id }}-gcopy"
+    motd:
+      - path: /etc/motd
+        when: [create, copy]
+        template: motd.tpl
+        properties:
+          greeting: hello
+        content: !unsafe "{{ config_get('user.greeting', properties.greeting) }} {{ instance.name }}\n"
+  block:
+    - name: Create a stopped container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ golden }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        state: stopped
+
+    - name: "MD0: check mode predicts a change"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        properties:
+          description: golden image
+        templates: "{{ motd }}"
+      check_mode: true
+      register: md0_result
+
+    - name: "MD1 and MD4: set a property and a template"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        properties:
+          description: golden image
+        templates: "{{ motd }}"
+      register: md1_result
+
+    - name: "MD2: run MD1 again"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        properties:
+          description: golden image
+        templates: "{{ motd }}"
+      diff: true
+      register: md2_result
+
+    - name: "MD1: copy the container and start the copy"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ copy }}"
+        source:
+          instance: "{{ golden }}"
+        state: started
+
+    - name: "MD1: read the rendered file in the copy"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ copy }}"
+        command: [cat, /etc/motd]
+      register: md1_motd
+
+    - name: "MD3: exact mode keeps only the motd template"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        templates: "{{ motd }}"
+        templates_mode: exact
+      register: md3_result
+
+    - name: "MD3: list the template files"
+      ansible.builtin.uri:
+        url: "{{ lxd_url }}/1.0/instances/{{ golden }}/metadata/templates"
+      register: md3_files
+
+    - name: "MD3: run it again"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        templates: "{{ motd }}"
+        templates_mode: exact
+      register: md3_again
+
+    - name: "MD5: exact properties remove the other properties"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        properties:
+          os: alpine
+        properties_mode: exact
+      register: md5_result
+
+    - name: "B1: a template with no file and no content"
+      smcavoy.lxd.lxd_instance_metadata:
+        instance: "{{ golden }}"
+        templates:
+          - path: /etc/none
+            when: [create]
+            template: none.tpl
+      register: b1_result
+      ignore_errors: true
+
+    - name: "MD0 to MD5 and B1: log the facts"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT metadata {{ md1_result.metadata | to_json }} files={{ md3_files.json.metadata | to_json }}"
+
+    - name: "MD0 to MD5 and B1: the property and the template apply, the copy renders it, and exact mode removes the rest"
+      ansible.builtin.assert:
+        that:
+          - md0_result is changed
+          - md1_result is changed
+          - md1_result.metadata.properties.description == 'golden image'
+          - md1_result.metadata.templates['/etc/motd'].template == 'motd.tpl'
+          - md2_result is not changed
+          - md2_result.diff.before == md2_result.diff.after
+          - md1_motd.stdout == 'hello ' ~ copy ~ '\n'
+          - md3_result is changed
+          - md3_result.metadata.templates | list == ['/etc/motd']
+          - md3_files.json.metadata | map('regex_replace', '^.*/', '') | list == ['motd.tpl']
+          - md3_again is not changed
+          - md5_result is changed
+          - "md5_result.metadata.properties == {'os': 'alpine'}"
+          - b1_result is failed
+          - b1_result.msg == 'template none.tpl has no file and no content'
+  always:
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: ["{{ copy }}", "{{ golden }}"]
+      failed_when: false

@@ -1,0 +1,204 @@
+# Goal: lxd_network_zone creates, updates, and deletes zones idempotently, and masks the peer keys.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_zone tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    zone: "t-{{ lxd_run_id }}.zone.test"
+    zone_url: "{{ lxd_url }}/1.0/network-zones/{{ zone }}"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          dns.nameservers: ns1.zone.test
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ zone_url }}"
+      register: c1_server
+
+    - name: "C2: create the zone"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        description: test zone
+        config:
+          dns.nameservers: ns1.zone.test
+      register: c2_result
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        description: test zone
+        config:
+          dns.nameservers: ns1.zone.test
+      register: c3_result
+
+    - name: "C1 to C3: check mode, create, and no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.zone.config['dns.nameservers'] == 'ns1.zone.test'
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts a change"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          dns.nameservers: ns2.zone.test
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C5: change the name servers"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          dns.nameservers: ns2.zone.test
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ zone_url }}"
+      register: c5_server
+
+    - name: "C4 and C5: the diff and the change"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.config['dns.nameservers'] == 'ns2.zone.test'
+          - c5_result is changed
+          - c5_server.json.metadata.config['dns.nameservers'] == 'ns2.zone.test'
+          - c5_server.json.metadata.description == 'test zone'
+
+    - name: "C6: add a user key with the API"
+      ansible.builtin.uri:
+        url: "{{ zone_url }}"
+        method: PUT
+        body:
+          description: "{{ c5_server.json.metadata.description }}"
+          config: "{{ c5_server.json.metadata.config | combine({'user.other': 'set-by-api'}) }}"
+
+    - name: "C6: run without the key in merge mode"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          dns.nameservers: ns2.zone.test
+      register: c6_result
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          dns.nameservers: ns2.zone.test
+          user.mine: set-by-module
+        config_mode: exact
+      register: c7_result
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          user.mine: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ zone_url }}"
+      register: c8_server
+
+    - name: "C6 to C8: merge keeps, exact removes, and null removes"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c7_result is changed
+          - "'user.other' not in c7_result.zone.config"
+          - c8_result is changed
+          - "'user.mine' not in c8_server.json.metadata.config"
+
+    - name: "Z2: add a peer with a TSIG key"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          peers.ns1.address: 192.0.2.53
+          peers.ns1.key: tsig-secret-value
+      diff: true
+      register: z2_result
+
+    - name: "Z2: the result and the diff mask the key"
+      ansible.builtin.assert:
+        that:
+          - z2_result is changed
+          - z2_result.zone.config['peers.ns1.key'] == '********'
+          - z2_result.diff.after.config['peers.ns1.key'] == '********'
+          - "'tsig-secret-value' not in (z2_result | to_json)"
+
+    - name: "C9: an unknown config key"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        config:
+          no.such.key: x
+      register: c9_result
+      ignore_errors: true
+
+    - name: "C9: LXD rejects the key"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C11: delete the zone"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ zone_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.zone is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the test zone
+      smcavoy.lxd.lxd_network_zone:
+        name: "{{ zone }}"
+        state: absent
+      failed_when: false

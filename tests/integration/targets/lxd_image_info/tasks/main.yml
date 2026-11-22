@@ -1,0 +1,58 @@
+# Goal: lxd_image_info finds images by alias, fingerprint prefix, and filter, and lists all images.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_image_info tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    run: "t-{{ lxd_run_id }}"
+  block:
+    - name: "I2: one image by alias"
+      smcavoy.lxd.lxd_image_info:
+        alias: "{{ lxd_image_ct }}"
+      register: i2_result
+
+    - name: "I1: list all"
+      smcavoy.lxd.lxd_image_info:
+      register: i1_result
+
+    - name: "I3: a missing alias"
+      smcavoy.lxd.lxd_image_info:
+        alias: no/such/image
+      register: i3_result
+
+    - name: "I4: list all in check mode"
+      smcavoy.lxd.lxd_image_info:
+      check_mode: true
+      register: i4_result
+
+    - name: "II1: one image by fingerprint prefix"
+      smcavoy.lxd.lxd_image_info:
+        fingerprint: "{{ i2_result.images[0].fingerprint[:12] }}"
+      register: ii1_result
+
+    - name: "II2: filter by the os property of the test image"
+      smcavoy.lxd.lxd_image_info:
+        filter: "properties.os eq {{ i2_result.images[0].properties.os }}"
+      register: ii2_result
+
+    - name: "I1 to I4, II1, II2: the reads find the test image"
+      ansible.builtin.assert:
+        that:
+          - i2_result.images | length == 1
+          - i2_result.images[0].fingerprint in (i1_result.images | map(attribute='fingerprint') | list)
+          - i3_result is not changed
+          - i3_result.images == []
+          - i4_result is not changed
+          - i4_result.images | length == i1_result.images | length
+          - ii1_result.images | length == 1
+          - ii1_result.images[0].fingerprint == i2_result.images[0].fingerprint
+          - ii2_result.images | length >= 1
+          - ii2_result.images | map(attribute='properties.os') | unique | list == [i2_result.images[0].properties.os]

@@ -1,0 +1,410 @@
+# Goal: lxd_instance_file puts files, directories, and links into a container idempotently, changes owner and mode, and removes them.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_instance_file tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-file"
+    # Independent reads with lxd_instance_exec: the owner, the group, the mode and the type from stat, then the content.
+    stat_of: [stat, -c, "%u %g %a %F"]
+    show_file: [sh, -c, "stat -c '%u %g %a %F' /tmp/test.txt && cat /tmp/test.txt"]
+    look_for_file: [sh, -c, "test -e /tmp/test.txt && echo present || echo absent"]
+  block:
+    - name: Start a container for the files
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "one\n"
+      check_mode: true
+      register: c1_result
+    - name: "C1: look for the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ look_for_file }}"
+      register: c1_server
+    - name: "C2: create the file"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "one\n"
+      register: c2_result
+    - name: "C2: read the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ show_file }}"
+      register: c2_server
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "one\n"
+      register: c3_result
+    - name: "C1 to C3: predicted, created, then no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c2_result is changed
+          - c2_result.file.sha256 == ('one\n' | hash('sha256'))
+          - c2_result.file.mode == '0644'
+          - c3_result is not changed
+          - c1_server.stdout == 'absent\n'
+          - c2_server.stdout == '0 0 644 regular file\none\n'
+
+    - name: "C4: check mode predicts a content change"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "two\n"
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ show_file }}"
+      register: c4_server
+    - name: "C5: change the content"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "two\n"
+      register: c5_result
+    - name: "C5: read the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ show_file }}"
+      register: c5_server
+    - name: "C4 and C5: the diff holds the text, and the content changes"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before.content == 'one\n'
+          - c4_result.diff.after.content == 'two\n'
+          - c5_result is changed
+          - c5_result.file.sha256 == ('two\n' | hash('sha256'))
+          - c4_server.stdout == '0 0 644 regular file\none\n'
+          - c5_server.stdout == '0 0 644 regular file\ntwo\n'
+
+    - name: "IF2: change only the mode and the owner"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "two\n"
+        mode: "0600"
+        owner_uid: 1000
+        owner_gid: 1000
+      register: if2_result
+    - name: "IF2: read the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ show_file }}"
+      register: if2_server
+    - name: "IF2: mode and owner change"
+      ansible.builtin.assert:
+        that:
+          - if2_result is changed
+          - if2_result.file.mode == '0600'
+          - if2_result.file.owner_uid == 1000
+          - if2_server.stdout == '1000 1000 600 regular file\ntwo\n'
+
+    # A task that sets only the content keeps the owner and the mode.
+    - name: "IF5: change only the content of the 1000:1000 0600 file"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "three\n"
+      register: if5_result
+    - name: "IF5: read the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ show_file }}"
+      register: if5_server
+    - name: "IF5: run again"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        content: "three\n"
+      register: if5b_result
+    - name: "IF5: the content changes, the owner and the mode stay, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - if5_result is changed
+          - if5_result.file.sha256 == ('three\n' | hash('sha256'))
+          - if5_result.file.mode == '0600'
+          - if5_result.file.owner_uid == 1000
+          - if5_result.file.owner_gid == 1000
+          - if5b_result is not changed
+          - if5_server.stdout == '1000 1000 600 regular file\nthree\n'
+
+    # A 50 MiB file streams to LXD and back without the whole file in memory.
+    - name: "IF6: make a 50 MiB file on the controller"
+      ansible.builtin.tempfile:
+        suffix: .bin
+      register: if6_src
+    - name: "IF6: fill it with random data"
+      ansible.builtin.command:
+        argv: [dd, if=/dev/urandom, "of={{ if6_src.path }}", bs=1M, count=50]
+      changed_when: true
+    - name: "IF6: the checksum of the file"
+      ansible.builtin.stat:
+        path: "{{ if6_src.path }}"
+        checksum_algorithm: sha256
+      register: if6_stat
+    - name: "IF6: copy the file into the instance"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/big.bin
+        src: "{{ if6_src.path }}"
+      register: if6_put
+    - name: "IF6: copy it again"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/big.bin
+        src: "{{ if6_src.path }}"
+      register: if6_again
+    - name: "IF6: change only the owner and the mode (the module writes the file again from its temporary copy)"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/big.bin
+        owner_uid: 1000
+        owner_gid: 1000
+        mode: "0600"
+      register: if6_owner
+    - name: "IF6: read the owner and the mode in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ stat_of + ['/tmp/big.bin'] }}"
+      register: if6_owner_server
+    - name: "IF6: change the owner of the 1000:1000 0600 file (LXD refuses the overwrite; the module writes it again)"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/big.bin
+        owner_uid: 1001
+      register: if6_owner2
+    - name: "IF6: read the new owner in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ stat_of + ['/tmp/big.bin'] }}"
+      register: if6_owner2_server
+    - name: "IF6: the checksum in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sha256sum, /tmp/big.bin]
+      register: if6_sum
+    - name: "IF6: the file arrives whole, a second copy makes no change, and owner changes keep the content"
+      ansible.builtin.assert:
+        that:
+          - if6_put is changed
+          - if6_put.file.sha256 == if6_stat.stat.checksum
+          - if6_again is not changed
+          - if6_owner is changed
+          - if6_owner.file.sha256 == if6_stat.stat.checksum
+          - if6_owner.file.owner_uid == 1000
+          - if6_owner2 is changed
+          - if6_owner2.file.owner_uid == 1001
+          - if6_owner2.file.mode == '0600'
+          - if6_owner2.file.sha256 == if6_stat.stat.checksum
+          - if6_sum.stdout.split()[0] == if6_stat.stat.checksum
+          - if6_owner_server.stdout == '1000 1000 600 regular file\n'
+          - if6_owner2_server.stdout == '1001 1000 600 regular file\n'
+    - name: "IF6: remove the file on the controller"
+      ansible.builtin.file:
+        path: "{{ if6_src.path }}"
+        state: absent
+
+    - name: "IF3: a directory"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir
+        type: directory
+      register: if3_result
+    - name: "IF4: a link"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testlink
+        type: link
+        link_target: /tmp/test.txt
+      register: if4_result
+    - name: "IF4: the link again"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testlink
+        type: link
+        link_target: /tmp/test.txt
+      register: if4b_result
+    - name: "IF3 and IF4: read the directory and the link in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "stat -c '%u %g %a %F' /tmp/testdir && stat -c %F /tmp/testlink && readlink /tmp/testlink"]
+      register: if4_server
+    - name: "IF3 and IF4: directory mode 0755, and an idempotent link"
+      ansible.builtin.assert:
+        that:
+          - if3_result is changed
+          - if3_result.file.mode == '0755'
+          - if3_result.file.type == 'directory'
+          - if4_result is changed
+          - if4_result.file.type == 'link'
+          - if4b_result is not changed
+          - if4_server.stdout == '0 0 755 directory\nsymbolic link\n/tmp/test.txt\n'
+
+    - name: "IF7: the directory again, with another owner and mode"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir
+        type: directory
+        owner_uid: 1000
+        mode: "0750"
+      register: if7_result
+      ignore_errors: true
+    - name: "IF7: the directory again, with its own mode"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir
+        type: directory
+        mode: "0755"
+      register: if7b_result
+    - name: "IF7: a mode with the sticky bit"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir2
+        type: directory
+        mode: "1777"
+      register: if7c_result
+      ignore_errors: true
+    - name: "IF7: read the directories in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [sh, -c, "stat -c '%u %g %a %F' /tmp/testdir && test ! -e /tmp/testdir2 && echo absent"]
+      register: if7_server
+    - name: "IF7: LXD cannot change a directory that exists, or set special bits, and the module says so"
+      ansible.builtin.assert:
+        that:
+          - if7_result is failed
+          - "'LXD cannot change the owner or the mode of a directory that exists' in if7_result.msg"
+          - if7b_result is not changed
+          - if7c_result is failed
+          - "'is not valid' in if7c_result.msg"
+          - if7_server.stdout == '0 0 755 directory\nabsent\n'
+
+    - name: "IF8: a link with a relative target, two times"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir/rel
+        type: link
+        link_target: ../test.txt
+      loop: [1, 2]
+      register: if8_result
+    - name: "IF8: read the relative link in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [readlink, /tmp/testdir/rel]
+      register: if8_rel_link
+    - name: "IF8: a new target for the link, two times"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/testdir/rel
+        type: link
+        link_target: /etc/hostname
+      loop: [1, 2]
+      register: if8b_result
+    - name: "IF8: read the link in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: [readlink, /tmp/testdir/rel]
+      register: if8_link
+    - name: "IF8: a relative target is idempotent, and a new target replaces the link"
+      ansible.builtin.assert:
+        that:
+          - if8_result.results[0] is changed
+          - if8_result.results[1] is not changed
+          - if8b_result.results[0] is changed
+          - if8b_result.results[1] is not changed
+          - if8_rel_link.stdout == '../test.txt\n'
+          - if8_link.stdout == '/etc/hostname\n'
+
+    - name: "C9: a relative path"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: tmp/relative.txt
+        content: x
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - "'path must be absolute' in c9_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        state: absent
+      check_mode: true
+      register: c10_result
+    - name: "C10: look for the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ look_for_file }}"
+      register: c10_server
+    - name: "C11: delete the file"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        state: absent
+      register: c11_result
+    - name: "C11: look for the file in the instance"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ ct }}"
+        command: "{{ look_for_file }}"
+      register: c11_server
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "{{ ct }}"
+        path: /tmp/test.txt
+        state: absent
+      register: c12_result
+    - name: "C10 to C12: predicted, deleted, then no change"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.file is none
+          - c12_result is not changed
+          - c10_server.stdout == 'present\n'
+          - c11_server.stdout == 'absent\n'
+
+    # A file of an instance that does not exist is absent, with a warning.
+    - name: "C13: delete a file of an instance that does not exist"
+      smcavoy.lxd.lxd_instance_file:
+        instance: "t-{{ lxd_run_id }}-no-such-instance"
+        path: /tmp/test.txt
+        state: absent
+      register: c13_result
+    - name: "C13: no change, and a warning names the instance"
+      ansible.builtin.assert:
+        that:
+          - c13_result is not changed
+          - c13_result.warnings | default([]) | select('search', 'no-such-instance does not exist') | list | length == 1
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

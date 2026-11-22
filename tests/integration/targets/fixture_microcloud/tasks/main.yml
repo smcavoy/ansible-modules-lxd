@@ -1,0 +1,83 @@
+# Goal: the MicroCloud fixture gives a three-member cluster with a Ceph pool and OVN networks, and a container runs on both.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the MicroCloud fixture checks
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  vars:
+    ct: "t-{{ lxd_run_id }}-mcct"
+  block:
+    - name: "F1: read the server"
+      smcavoy.lxd.lxd_server_info:
+      register: f1_server
+
+    - name: "F1: read the members"
+      smcavoy.lxd.lxd_cluster_member_info:
+      register: f1_members
+
+    - name: "F1: read the Ceph pool"
+      smcavoy.lxd.lxd_storage_pool_info:
+        name: "{{ lxd_ceph_pool }}"
+      register: f1_pool
+
+    - name: "F1: read the OVN networks"
+      smcavoy.lxd.lxd_network_info:
+      register: f1_networks
+
+    - name: "F1: log the versions and the parts"
+      ansible.builtin.debug:
+        msg: >-
+          LXDTEST-FACT microcloud lxd={{ f1_server.server.environment.server_version }}
+          storage={{ f1_server.server.environment.storage }} {{ f1_server.server.environment.storage_version }}
+          pools={{ f1_pool.storage_pools | map(attribute='name') | list | to_json }}
+          networks={{ f1_networks.networks | map(attribute='name') | list | to_json }}
+          types={{ f1_networks.networks | map(attribute='type') | list | to_json }}
+          roles={{ f1_members.members | map(attribute='roles') | list | to_json }}
+
+    - name: "F1: three online members, a Ceph pool, and the OVN networks"
+      ansible.builtin.assert:
+        that:
+          - f1_members.members | length == 3
+          - f1_members.members | selectattr('status', 'equalto', 'Online') | list | length == 3
+          - f1_pool.storage_pools[0].driver == 'ceph'
+          - f1_networks.networks | selectattr('name', 'equalto', lxd_ovn_uplink) | map(attribute='type') | first == 'physical'
+          - f1_networks.networks | selectattr('name', 'equalto', lxd_ovn_network) | map(attribute='type') | first == 'ovn'
+
+    - name: "F2: start a container on Ceph and OVN"
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          root:
+            type: disk
+            pool: "{{ lxd_ceph_pool }}"
+            path: /
+          eth0:
+            type: nic
+            network: "{{ lxd_ovn_network }}"
+            name: eth0
+        wait_for:
+          - type: ipv4
+        wait_timeout: 240
+      register: f2_result
+
+    - name: "F2: the container has an address on the OVN network"
+      ansible.builtin.assert:
+        that:
+          - f2_result.instance.status == 'Running'
+          - f2_result.addresses | length > 0
+  always:
+    - name: Remove the container
+      smcavoy.lxd.lxd_instance:
+        name: "{{ ct }}"
+        state: absent
+        force: true
+      failed_when: false

@@ -1,0 +1,300 @@
+# Goal: lxd_image_registry creates, updates, and deletes a simplestreams registry idempotently, and protects built-in registries.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# LXD only checks the config when it creates a registry. It contacts the URL when it lists images, which no case does.
+- name: Run the lxd_image_registry tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 202, 404]
+  vars:
+    reg: "t-{{ lxd_run_id }}-reg"
+    reg_url: "{{ lxd_url }}/1.0/image-registries/{{ reg }}"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          url: https://images.example.invalid
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c1_server
+
+    - name: "C1: check mode predicts a create"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_result.image_registry.protocol == 'simplestreams'
+          - c1_server.status == 404
+
+    - name: "C2: create the registry"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        description: test registry
+        config:
+          url: https://images.example.invalid
+      register: c2_result
+
+    - name: "C2: the module creates the registry"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_result.image_registry.protocol == 'simplestreams'
+          - c2_result.image_registry.builtin is false
+          - c2_result.image_registry.config.url == 'https://images.example.invalid'
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        description: test registry
+        config:
+          url: https://images.example.invalid
+      register: c3_result
+
+    - name: "C3: a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+
+    - name: "C4: check mode predicts a URL change"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          url: https://mirror.example.invalid
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c4_server
+
+    - name: "C4: the diff shows the URL, and the server keeps the old value"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.config.url == 'https://mirror.example.invalid'
+          - c4_server.json.metadata.config.url == 'https://images.example.invalid'
+
+    - name: "C5: change the URL"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          url: https://mirror.example.invalid
+      register: c5_result
+
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c5_server
+
+    - name: "C5: the module changes the URL and keeps the description"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config.url == 'https://mirror.example.invalid'
+          - c5_server.json.metadata.description == 'test registry'
+
+    - name: "C6: add a user key with the API"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+        method: PUT
+        body:
+          description: "{{ c5_server.json.metadata.description }}"
+          config: "{{ c5_server.json.metadata.config | combine({'user.other': 'set-by-api'}) }}"
+
+    - name: "C6: run without the key in merge mode"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          url: https://mirror.example.invalid
+      register: c6_result
+
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c6_server
+
+    - name: "C6: merge keeps keys that other tools set"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+
+    - name: "C7: run with config_mode exact"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          url: https://mirror.example.invalid
+          user.mine: set-by-module
+        config_mode: exact
+      register: c7_result
+
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c7_server
+
+    - name: "C7: exact removes unmanaged keys"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+          - c7_server.json.metadata.config['user.mine'] == 'set-by-module'
+
+    - name: "C8: remove one key with null"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          user.mine: null
+      register: c8_result
+
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c8_server
+
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'user.mine' not in c8_server.json.metadata.config"
+
+    - name: "IR1: change the built-in registry images"
+      smcavoy.lxd.lxd_image_registry:
+        name: images
+        description: changed by a test
+      register: ir1_result
+      ignore_errors: true
+
+    - name: "IR2: move the registry to the LXD protocol"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        config:
+          cluster: other
+          source_project: default
+        config_mode: exact
+      register: ir2_result
+      ignore_errors: true
+
+    - name: "IR3: a URL with a password"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}-pw"
+        config:
+          url: https://user:secret@images.example.invalid
+      register: ir3_result
+      ignore_errors: true
+
+    - name: "C9, IR1 to IR3: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - ir1_result is failed
+          - "'built-in' in ir1_result.msg"
+          - ir2_result is failed
+          - "'cannot change' in ir2_result.msg"
+          - ir3_result is failed
+          - "'Basic authentication' in ir3_result.msg"
+
+    - name: "IR4: create a project that blocks image registries"
+      smcavoy.lxd.lxd_project:
+        name: "{{ reg }}-blocked"
+        config:
+          features.images: true
+          restricted: true
+          restricted.registries: block
+
+    # LXD checks restricted.registries before it contacts the registry, so the placeholder URL is enough.
+    - name: "IR4: copy an image from the registry into that project"
+      smcavoy.lxd.lxd_image:
+        project: "{{ reg }}-blocked"
+        aliases:
+          - name: blocked/image
+        source:
+          image_registry: "{{ reg }}"
+          alias: anything
+      register: ir4_result
+      ignore_errors: true
+
+    - name: "IR4: the project cannot use the registry"
+      ansible.builtin.assert:
+        that:
+          - ir4_result is failed
+          - "'not allowed in this project' in ir4_result.msg"
+
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c10_server
+
+    - name: "C10: the registry still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+
+    - name: "C11: delete the registry"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ reg_url }}"
+      register: c11_server
+
+    - name: "C11: the module deletes the registry"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.image_registry is none
+          - c11_server.status == 404
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ reg }}"
+        state: absent
+      register: c12_result
+
+    - name: "C12: a second delete makes no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the blocked project
+      smcavoy.lxd.lxd_project:
+        name: "{{ reg }}-blocked"
+        state: absent
+      failed_when: false
+
+    - name: Remove the test registries
+      smcavoy.lxd.lxd_image_registry:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ reg }}"
+        - "{{ reg }}-pw"
+      failed_when: false

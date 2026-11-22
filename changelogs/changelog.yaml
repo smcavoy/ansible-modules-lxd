@@ -1,0 +1,393 @@
+ancestor: null
+releases:
+  0.1.0:
+    changes:
+      bugfixes:
+      - all modules - ``state=absent`` with a project that does not exist now fails
+        and names the project, instead of reporting the object as absent. A missing
+        parent object gives a warning.
+      - all modules - a connection error, such as a wrong ``server_fingerprint``,
+        now shows its text and not a Python tuple.
+      - all modules - an LXD operation longer than 60 seconds no longer fails with
+        ``context deadline exceeded``. The wait goes on until ``timeout``, also through
+        short connection breaks, and a timeout says that the operation can still run.
+      - all modules - check mode no longer uses up a one-time ``trust_token``.
+      - 'all modules - the wait for an operation now goes on while LXD restarts. Before,
+        the HTTP 500 that LXD sends during its shutdown (``sql: database is closed``)
+        failed the task at once.'
+      - all modules - the wait for an operation now keeps to ``timeout`` when the
+        connection to LXD hangs. Before, each read retry waited a full socket timeout,
+        so a 40 second timeout could run more than 2 minutes.
+      - all modules - when LXD no longer knows an operation after a connection break,
+        the error now says that the operation can have finished during the break and
+        that its result is unknown.
+      - all modules - when two runs create the same object at the same time, the second
+        run no longer fails with ``already exists``. It reads the object again once
+        and updates it if needed.
+      - lxd_instance_backup, lxd_storage_volume_backup, lxd_image_export, lxd_image
+        - backups and images are now streamed to and from disk in 1 MiB chunks, not
+        held whole in controller memory. A download broken by a connection reset starts
+        the file again.
+      - lxd_instance_exec - when LXD restarts or the connection breaks during the
+        command, the error now says that the command can still run in the instance,
+        or that it ran, and that a new run of the task runs it again. Before, it said
+        to run the task again.
+      - lxd_instance_file - ``owner_uid``, ``owner_gid`` and ``mode`` now keep the
+        values of an existing path when the task does not set them. Before, a task
+        that set only ``content`` changed the file to root and ``0644``.
+      - lxd_instance_file - a file that root in the instance does not own and that
+        gives no write to others (for example ``0600`` owned by uid 1000) can now
+        be changed. LXD refuses that overwrite with 403, so the module deletes the
+        file and writes it again. The inode changes, so hard links to the file break.
+      - lxd_instance_file - files are now streamed. The file in the instance is read
+        into a temporary file for the SHA-256 compare, and uploads (of ``src``, and
+        a write again for an owner or mode change) stream from disk, so a large file
+        does not need controller memory.
+      release_summary: 'The first release of ``smcavoy.lxd``: 63 modules for the LXD
+        6.10 REST API, with no Python dependency outside ansible-core. Tested against
+        LXD 6.10.1 on standalone servers, clusters, linked clusters and MicroCloud
+        (OVN and Ceph), on ansible-core 2.19 to 2.22 and Python 3.11 to 3.13.'
+    fragments:
+    - 0.1.0-release.yml
+    - 12-wait-deadline.yml
+    - 6-create-race.yml
+    - 7-instance-file-owner-mode.yml
+    - 8-stream-large-files.yml
+    - 9-connection-error-text.yml
+    - ci-and-tests-2026-11-08.yml
+    - review-2026-11-08.yml
+    - server-faults.yml
+    - stream-instance-file.yml
+    modules:
+    - description: Manage LXD authorization groups.
+      name: lxd_auth_group
+      namespace: ''
+    - description: Manage LXD TLS, bearer, and OIDC identities.
+      name: lxd_auth_identity
+      namespace: ''
+    - description: Map identity provider groups to LXD groups.
+      name: lxd_auth_identity_provider_group
+      namespace: ''
+    - description: Issue and revoke tokens of LXD bearer identities.
+      name: lxd_auth_identity_token
+      namespace: ''
+    - description: Read LXD access control.
+      name: lxd_auth_info
+      namespace: ''
+    - description: Form an LXD cluster, join it, or remove a member.
+      name: lxd_cluster
+      namespace: ''
+    - description: Replace the certificate of an LXD cluster.
+      name: lxd_cluster_certificate
+      namespace: ''
+    - description: Manage LXD cluster groups.
+      name: lxd_cluster_group
+      namespace: ''
+    - description: Issue and revoke LXD cluster join tokens.
+      name: lxd_cluster_join_token
+      namespace: ''
+    - description: Manage links between LXD clusters.
+      name: lxd_cluster_link
+      namespace: ''
+    - description: Read LXD cluster links.
+      name: lxd_cluster_link_info
+      namespace: ''
+    - description: Manage LXD cluster members.
+      name: lxd_cluster_member
+      namespace: ''
+    - description: Read LXD cluster members.
+      name: lxd_cluster_member_info
+      namespace: ''
+    - description: Manage LXD images.
+      name: lxd_image
+      namespace: ''
+    - description: Manage LXD image aliases.
+      name: lxd_image_alias
+      namespace: ''
+    - description: Download an LXD image to the controller.
+      name: lxd_image_export
+      namespace: ''
+    - description: Read LXD images.
+      name: lxd_image_info
+      namespace: ''
+    - description: Manage LXD image registries.
+      name: lxd_image_registry
+      namespace: ''
+    - description: Read LXD image registries.
+      name: lxd_image_registry_info
+      namespace: ''
+    - description: Manage LXD containers and virtual machines.
+      name: lxd_instance
+      namespace: ''
+    - description: Manage LXD instance backups.
+      name: lxd_instance_backup
+      namespace: ''
+    - description: Manage one device of an LXD instance.
+      name: lxd_instance_device
+      namespace: ''
+    - description: Run a command in an LXD instance.
+      name: lxd_instance_exec
+      namespace: ''
+    - description: Manage files, directories, and symlinks in LXD instances.
+      name: lxd_instance_file
+      namespace: ''
+    - description: Read LXD instances.
+      name: lxd_instance_info
+      namespace: ''
+    - description: Read the log files of an LXD instance.
+      name: lxd_instance_log_info
+      namespace: ''
+    - description: Manage the metadata and templates of an LXD instance.
+      name: lxd_instance_metadata
+      namespace: ''
+    - description: Rebuild the root disk of an LXD instance.
+      name: lxd_instance_rebuild
+      namespace: ''
+    - description: Manage LXD instance snapshots.
+      name: lxd_instance_snapshot
+      namespace: ''
+    - description: Manage LXD networks.
+      name: lxd_network
+      namespace: ''
+    - description: Manage LXD network ACLs.
+      name: lxd_network_acl
+      namespace: ''
+    - description: Read LXD network ACLs.
+      name: lxd_network_acl_info
+      namespace: ''
+    - description: Read the addresses that LXD networks use.
+      name: lxd_network_allocation_info
+      namespace: ''
+    - description: Manage LXD network forwards.
+      name: lxd_network_forward
+      namespace: ''
+    - description: Read LXD networks.
+      name: lxd_network_info
+      namespace: ''
+    - description: Manage LXD OVN load balancers.
+      name: lxd_network_load_balancer
+      namespace: ''
+    - description: Manage LXD OVN load balancer pools.
+      name: lxd_network_load_balancer_pool
+      namespace: ''
+    - description: Manage peers between LXD OVN networks.
+      name: lxd_network_peer
+      namespace: ''
+    - description: Manage LXD network zones.
+      name: lxd_network_zone
+      namespace: ''
+    - description: Manage records in LXD network zones.
+      name: lxd_network_zone_record
+      namespace: ''
+    - description: Read LXD operations.
+      name: lxd_operation_info
+      namespace: ''
+    - description: Manage LXD placement groups.
+      name: lxd_placement_group
+      namespace: ''
+    - description: Manage LXD profiles.
+      name: lxd_profile
+      namespace: ''
+    - description: Read LXD profiles.
+      name: lxd_profile_info
+      namespace: ''
+    - description: Manage LXD projects.
+      name: lxd_project
+      namespace: ''
+    - description: Read LXD projects.
+      name: lxd_project_info
+      namespace: ''
+    - description: Manage LXD replicators.
+      name: lxd_replicator
+      namespace: ''
+    - description: Read LXD replicators.
+      name: lxd_replicator_info
+      namespace: ''
+    - description: Run an LXD replicator.
+      name: lxd_replicator_run
+      namespace: ''
+    - description: Manage the LXD server config.
+      name: lxd_server_config
+      namespace: ''
+    - description: Read LXD server information.
+      name: lxd_server_info
+      namespace: ''
+    - description: Manage LXD storage buckets.
+      name: lxd_storage_bucket
+      namespace: ''
+    - description: Manage access keys of LXD storage buckets.
+      name: lxd_storage_bucket_key
+      namespace: ''
+    - description: Manage LXD storage pools.
+      name: lxd_storage_pool
+      namespace: ''
+    - description: Read LXD storage pools.
+      name: lxd_storage_pool_info
+      namespace: ''
+    - description: Manage LXD custom storage volumes.
+      name: lxd_storage_volume
+      namespace: ''
+    - description: Manage backups of LXD custom storage volumes.
+      name: lxd_storage_volume_backup
+      namespace: ''
+    - description: Read LXD storage volumes.
+      name: lxd_storage_volume_info
+      namespace: ''
+    - description: Manage snapshots of LXD custom storage volumes.
+      name: lxd_storage_volume_snapshot
+      namespace: ''
+    - description: Manage certificates in the LXD trust store.
+      name: lxd_trust_certificate
+      namespace: ''
+    - description: Issue and revoke LXD trust tokens.
+      name: lxd_trust_token
+      namespace: ''
+    - description: Acknowledge or delete LXD warnings.
+      name: lxd_warning
+      namespace: ''
+    - description: Read LXD warnings.
+      name: lxd_warning_info
+      namespace: ''
+    release_date: '2026-11-08'
+  0.1.1:
+    changes:
+      bugfixes:
+      - lxd_auth_group - a permission URL of an entity in the default project without
+        ``?project=default`` no longer reports a change on every run.
+      - lxd_auth_identity_token - an expired token no longer counts as a token. LXD
+        6.10.1 keeps the type of the identity after the expiry time, so the module
+        reported ``ok`` and the client stayed locked out. The module now reads ``expires_at``
+        and issues a new token.
+      - lxd_cluster_member - ``evacuate_mode=auto`` now sends no mode, so that LXD
+        chooses for each instance. LXD 6.10.1 has no mode of that name and refused
+        it when the member had an instance.
+      - lxd_cluster_member - the module now knows the automatic roles of LXD 6.10.1
+        (``database-voter``, ``database-standby``, ``database-leader``). Before, a
+        task with ``roles`` reported a change on every run for a member with the role
+        ``database-voter``.
+      - lxd_image - ``expires_at=""`` on an image with an expiry date now fails with
+        a clear message. LXD cannot remove the date, and the module reported a change
+        on every run.
+      - lxd_instance_backup, lxd_storage_volume_backup, lxd_image_export, lxd_instance_file
+        - a download that the server cuts short is no longer taken as a complete file.
+        The client compares the size with ``Content-Length`` and reads again.
+      - lxd_instance_exec - ``removes`` with an instance that does not exist now fails.
+        Before, the task reported ``ok`` as if the path did not exist.
+      - lxd_instance_file - a link with a relative target is now idempotent, and a
+        new target replaces a link that exists. Before, the first reported a change
+        on every run and the second failed with "file exists".
+      - lxd_instance_file - a write on a full disk no longer leaves a wrong file behind
+        without a word. LXD 6.10.1 creates or empties the file before it writes, and
+        on a full btrfs pool it can answer a small write with success and store nothing.
+        The module now reads the file back after each write and fails when the content
+        differs. After a failed write it deletes a new file, or tries to write the
+        old content back and says whether that worked.
+      - lxd_instance_file - the module fails with a clear message when a directory
+        exists with another owner or mode. LXD cannot change them, and the module
+        reported a change on every run. A mode with the setuid, setgid or sticky bit
+        is refused for the same reason.
+      - lxd_instance_rebuild, lxd_instance_device - a frozen instance, and an instance
+        with the status ``Ready``, now count as running. ``force`` and ``allow_restart``
+        stop them as they stop a running instance.
+      - lxd_instance_snapshot, lxd_storage_volume_snapshot - ``expires_at=""`` on
+        a new snapshot now makes a snapshot that never expires. Before, LXD used ``snapshots.expiry``
+        of the instance or the volume, and a second run was necessary.
+      - lxd_network, lxd_storage_pool - a change of a member-specific key on a cluster
+        (``member_config``) no longer removes the global config of the network or
+        the pool. LXD 6.10.1 replaces the whole config on a ``PUT`` with a target,
+        and the module sent only the member-specific keys.
+      - 'lxd_network_acl, lxd_network_forward, lxd_network_load_balancer - values
+        that LXD stores in another form no longer report a change on every run: spaces
+        in the lists of addresses and ports, and IP addresses that are not in the
+        canonical form. An upper-case IPv6 ``listen_address`` no longer fails on the
+        second run.'
+      - lxd_storage_volume_info - ``include_state=true`` no longer fails on a pool
+        that holds an image volume. LXD has a state only for custom, container and
+        virtual-machine volumes. For other volumes ``state`` is null.
+      release_summary: 'A bugfix release. It has the fixes of a code review
+        and the fix for file writes on a full disk. Two tasks that reported a change
+        on every run now fail with a clear message, because LXD cannot do what they
+        ask: ``lxd_instance_file`` for a directory that exists with another owner
+        or mode, and ``lxd_image`` with ``expires_at=""`` on an image that has an
+        expiry date. Tested against LXD 6.10.1.'
+      security_fixes:
+      - lxd_network, lxd_network_info - the modules now mask the BGP peer passwords
+        (``bgp.peers.<name>.password``) in the result and the diff. Before, the password
+        was in the output of the task.
+      - lxd_storage_pool, lxd_storage_pool_info - the modules now mask the secrets
+        of the remote storage drivers (``alletra.user.password``, ``powerflex.user.password``,
+        ``powerstore.user.password``, ``pure.api.token``) in the result and the diff.
+    fragments:
+    - full-disk-file-write.yml
+    - release-0.1.1.yml
+    - review-2026-11-13-part-2.yml
+    - review-2026-11-13.yml
+    release_date: '2026-11-13'
+  0.1.2:
+    changes:
+      bugfixes:
+      - lxd_network, lxd_storage_pool - a network or a pool whose cluster create did
+        not finish now fails the task. LXD 6.10.1 leaves such an object with the status
+        ``Pending`` (the create stopped after the member step) or ``Errored`` (the
+        cluster step failed), and cannot use it. Before, the modules reported ``ok``.
+        The message names the status and the members, and says to remove the object
+        with ``state=absent`` and run the task again.
+      release_summary: A bugfix release. ``lxd_network`` and ``lxd_storage_pool``
+        now fail on a network or a pool whose cluster create did not finish (the status
+        ``Pending`` or ``Errored``). Before, they reported ``ok`` for an object that
+        LXD cannot use. Tested against LXD 6.10.1.
+    fragments:
+    - m15-unfinished-cluster-create.yml
+    - release-0.1.2.yml
+    release_date: '2026-11-14'
+  0.1.3:
+    changes:
+      bugfixes:
+      - lxd_cluster - a boolean ``value`` in ``join_config`` now goes to LXD as ``"true"``
+        or ``"false"``. Before, ``true`` went as ``"True"`` and ``false`` as an empty
+        string.
+      - lxd_cluster_group - ``state=absent`` on a group that is in use (its ``used_by``
+        is not empty, for example a project with ``restricted.cluster.groups`` or
+        an instance placed with ``target=@group``) now fails before any change, and
+        the message names the users. Before, the module removed the members of the
+        group, and then LXD 6.10.1 refused the delete with ``Cluster group is currently
+        in use``.
+      - lxd_instance - ``state=restarted`` on a frozen instance now restarts it. Before,
+        the module only sent ``unfreeze`` and reported a restart that did not happen.
+        LXD 6.10.1 refuses the restart of a frozen instance, so the module sends ``unfreeze``
+        and then ``restart``.
+      - lxd_instance_file, lxd_instance_exec - an error on the read of a path (the
+        ``HEAD`` request, also for ``creates`` and ``removes``) now has the message
+        of LXD, for example ``not a directory``. Before, the message was only ``HTTP
+        500``, because the answer to a ``HEAD`` has no body. The client reads the
+        error text with a ``GET`` of the same path, and does not read a file for it.
+      - 'lxd_instance_info - ``all_projects`` now works with ``name``: the module
+        returns the instances of that name from all projects. Before, it returned
+        only the instance of the default project.'
+      - lxd_network_forward - the module now compares ``config.target_address`` in
+        the canonical form that LXD stores (``fd42::10`` for ``FD42:0::0010``). Before,
+        another spelling of the address reported a change on every run.
+      - lxd_network_forward - the module now refuses the unspecified address (``0.0.0.0``
+        or ``::``) before it sends a request. As ``listen_address``, LXD reads it
+        as a request to allocate an address, so the forward does not get the address
+        of the task. As ``config.target_address`` or the ``target_address`` of a port,
+        LXD refuses it.
+      - lxd_storage_volume_info - on a cluster, ``include_state`` now asks the member
+        that holds each volume (its ``location``) for the state. Before, the state
+        request used the ``target`` of the task, or no member.
+      - lxd_storage_volume_snapshot - ``target`` on a server that is not a cluster
+        now fails with ``target is only valid on a clustered server``, as in ``lxd_storage_volume``.
+        Before, LXD answered ``Cluster member not found``, which the module read as
+        a snapshot that does not exist.
+      security_fixes:
+      - lxd_server_config, lxd_server_info - the modules now mask the password in
+        the URL of ``core.proxy_http`` and ``core.proxy_https`` in the result and
+        the diff, for example ``http://user:********@proxy:3128``. The user, the host,
+        and the port stay. ``lxd_server_config`` also names the password of the task
+        to Ansible as a secret, and still compares the real values. Before, the password
+        was in the output.
+    fragments:
+    - batch-2026-11-21-a.yml
+    - batch-2026-11-21-b.yml
+    - batch-2026-11-21-c.yml
+    release_date: '2026-11-21'

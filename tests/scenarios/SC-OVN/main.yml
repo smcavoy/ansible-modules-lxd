@@ -1,0 +1,236 @@
+# Goal: SC-OVN peers two OVN networks, limits traffic into one of them with an ACL, and spreads requests with a load balancer.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: SC-OVN peers, an ACL and a load balancer
+  hosts: localhost
+  gather_facts: false
+  vars:
+    net_a: "t{{ lxd_run_id }}oa"
+    net_b: "t{{ lxd_run_id }}ob"
+    acl: "t-{{ lxd_run_id }}-web"
+    vip: 10.250.200.20
+    web: ["t-{{ lxd_run_id }}-oa1", "t-{{ lxd_run_id }}-oa2"]
+    client: "t-{{ lxd_run_id }}-ob1"
+    # The uplink gateway of the fixture has no route to a listen address of network A.
+    # Run 903 showed that a client on network B gets no answer from the load balancer. So a client on network A asks it.
+    client_a: "t-{{ lxd_run_id }}-oa3"
+    # Each web server answers on port 80 and port 81 with its name and the port.
+    serve: >-
+      name=$(hostname | tail -c 4);
+      for port in 80 81; do
+      (while true; do
+      printf 'HTTP/1.0 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n%s-%s\n' "$name" "$port" | nc -l -p "$port";
+      done) >/dev/null 2>&1 &
+      done
+    net_a_acl:
+      security.acls: "{{ acl }}"
+      security.acls.default.ingress.action: reject
+      security.acls.default.egress.action: allow
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+  tasks:
+    - name: Run the scenario
+      block:
+        - name: "SC-OVN 1: allow listen addresses on the uplink"
+          smcavoy.lxd.lxd_network:
+            name: "{{ lxd_ovn_uplink }}"
+            config:
+              ipv4.routes: 10.250.200.0/24
+
+        - name: "SC-OVN 2: create the two OVN networks"
+          smcavoy.lxd.lxd_network:
+            name: "{{ item }}"
+            type: ovn
+            description: SC-OVN
+            config:
+              network: "{{ lxd_ovn_uplink }}"
+              # The uplink has no IPv6. Without this key, LXD gives the network an IPv6 address, and each later update fails.
+              ipv6.address: none
+          loop: ["{{ net_a }}", "{{ net_b }}"]
+
+        - name: "SC-OVN 3: peer the networks in both directions"
+          smcavoy.lxd.lxd_network_peer:
+            network: "{{ item.network }}"
+            name: "{{ item.name }}"
+            target_network: "{{ item.target }}"
+          loop:
+            - {network: "{{ net_a }}", name: to-b, target: "{{ net_b }}"}
+            - {network: "{{ net_b }}", name: to-a, target: "{{ net_a }}"}
+          register: sc_peers
+
+        - name: "SC-OVN 4: start two web servers on network A and a client on network B"
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item.name }}"
+            source:
+              image: "{{ lxd_image_ct }}"
+            devices:
+              eth0:
+                type: nic
+                network: "{{ item.network }}"
+                name: eth0
+            wait_for:
+              - type: ipv4
+            wait_timeout: 240
+          loop:
+            - {name: "{{ web[0] }}", network: "{{ net_a }}"}
+            - {name: "{{ web[1] }}", network: "{{ net_a }}"}
+            - {name: "{{ client }}", network: "{{ net_b }}"}
+            - {name: "{{ client_a }}", network: "{{ net_a }}"}
+          register: sc_started
+
+        - name: "SC-OVN 5: start the web servers"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ item }}"
+            command: [sh, -c, "{{ serve }}"]
+          loop: "{{ web }}"
+
+        - name: "SC-OVN 6: collect the addresses of the web servers"
+          ansible.builtin.set_fact:
+            web_ip: >-
+              {{ sc_started.results[:2] | map(attribute='addresses') | map(attribute='eth0')
+              | map('select', 'match', '^[0-9.]+$') | map('first') | list }}
+
+        - name: "SC-OVN 7: ask web server 1 on both ports through the peer, before the ACL"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ client }}"
+            command:
+              - sh
+              - -c
+              - "for port in 80 81; do wget -q -T 5 -O- http://{{ web_ip[0] }}:$port/ || echo none-$port; done"
+          register: sc_open
+
+        - name: "SC-OVN 8: create an ACL that allows only port 80 in"
+          smcavoy.lxd.lxd_network_acl:
+            name: "{{ acl }}"
+            description: SC-OVN web
+            ingress:
+              - action: allow
+                protocol: tcp
+                destination_port: "80"
+            egress: []
+
+        - name: "SC-OVN 9: apply the ACL to network A, and reject all other traffic in"
+          smcavoy.lxd.lxd_network:
+            name: "{{ net_a }}"
+            config: "{{ net_a_acl }}"
+
+        - name: "SC-OVN 10: ask web server 1 on both ports again"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ client }}"
+            command:
+              - sh
+              - -c
+              - "for port in 80 81; do wget -q -T 5 -O- http://{{ web_ip[0] }}:$port/ || echo none-$port; done"
+          register: sc_limited
+
+        - name: "SC-OVN 11: create a load balancer on network A for port 80 of both web servers"
+          smcavoy.lxd.lxd_network_load_balancer:
+            network: "{{ net_a }}"
+            listen_address: "{{ vip }}"
+            description: SC-OVN web
+            backends:
+              - name: web1
+                target_address: "{{ web_ip[0] }}"
+                target_port: "80"
+              - name: web2
+                target_address: "{{ web_ip[1] }}"
+                target_port: "80"
+            ports:
+              - protocol: tcp
+                listen_port: "80"
+                target_backend: [web1, web2]
+
+        - name: "SC-OVN 12: ask the load balancer ten times from network A"
+          smcavoy.lxd.lxd_instance_exec:
+            instance: "{{ client_a }}"
+            command:
+              - sh
+              - -c
+              - "for i in 1 2 3 4 5 6 7 8 9 10; do wget -q -T 5 -O- http://{{ vip }}/ || echo none; done"
+          register: sc_balanced
+
+        - name: "SC-OVN 13: log the answers"
+          ansible.builtin.debug:
+            msg: >-
+              LXDTEST-FACT sc-ovn open={{ sc_open.stdout_lines | to_json }} limited={{ sc_limited.stdout_lines | to_json }}
+              balanced={{ sc_balanced.stdout_lines | to_json }}
+
+        - name: "SC-OVN 14: run the ACL and the network steps again"
+          smcavoy.lxd.lxd_network_acl:
+            name: "{{ acl }}"
+            description: SC-OVN web
+            ingress:
+              - action: allow
+                protocol: tcp
+                destination_port: "80"
+            egress: []
+          register: sc_acl_again
+
+        - name: "SC-OVN 15: run the network A step again"
+          smcavoy.lxd.lxd_network:
+            name: "{{ net_a }}"
+            config: "{{ net_a_acl }}"
+          register: sc_net_again
+
+        - name: "SC-OVN 16: the peers work, the ACL blocks port 81 only, both web servers answer through the load balancer, and a second run makes no change"
+          ansible.builtin.assert:
+            that:
+              - sc_peers.results[1].peer.status == 'Created'
+              - sc_open.stdout_lines == ['oa1-80', 'oa1-81']
+              - sc_limited.stdout_lines == ['oa1-80', 'none-81']
+              - "'oa1-80' in sc_balanced.stdout_lines"
+              - "'oa2-80' in sc_balanced.stdout_lines"
+              - sc_acl_again is not changed
+              - sc_net_again is not changed
+      always:
+        - name: Remove the containers
+          smcavoy.lxd.lxd_instance:
+            name: "{{ item }}"
+            state: absent
+            force: true
+          loop: "{{ web + [client, client_a] }}"
+          failed_when: false
+
+        - name: Remove the load balancer
+          smcavoy.lxd.lxd_network_load_balancer:
+            network: "{{ net_a }}"
+            listen_address: "{{ vip }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the peers
+          smcavoy.lxd.lxd_network_peer:
+            network: "{{ item.network }}"
+            name: "{{ item.name }}"
+            state: absent
+          loop:
+            - {network: "{{ net_a }}", name: to-b}
+            - {network: "{{ net_b }}", name: to-a}
+          failed_when: false
+
+        - name: Remove the OVN networks
+          smcavoy.lxd.lxd_network:
+            name: "{{ item }}"
+            state: absent
+          loop: ["{{ net_a }}", "{{ net_b }}"]
+          failed_when: false
+
+        - name: Remove the ACL
+          smcavoy.lxd.lxd_network_acl:
+            name: "{{ acl }}"
+            state: absent
+          failed_when: false
+
+        - name: Remove the uplink routes
+          smcavoy.lxd.lxd_network:
+            name: "{{ lxd_ovn_uplink }}"
+            config:
+              ipv4.routes: null
+          failed_when: false

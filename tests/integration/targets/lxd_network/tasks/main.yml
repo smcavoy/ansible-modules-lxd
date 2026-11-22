@@ -1,0 +1,245 @@
+# Goal: lxd_network creates, updates, and deletes a bridge idempotently, treats auto addresses as equal, and warns about a type change.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 201, 202, 404]
+  vars:
+    net: "tb{{ lxd_run_id }}n"
+    net_url: "{{ lxd_url }}/1.0/networks/tb{{ lxd_run_id }}n"
+    net_subnet: "10.{{ 190 + (lxd_slot | int) }}.0"
+  block:
+    - name: "C1: check mode predicts a create"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        description: "test bridge"
+        config:
+          ipv4.address: "{{ net_subnet }}.1/24"
+          ipv4.nat: true
+          ipv6.address: "none"
+      check_mode: true
+      register: c1_result
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c1_server
+    - name: "C1: nothing exists yet"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+    - name: "C2: create"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        description: "test bridge"
+        config:
+          ipv4.address: "{{ net_subnet }}.1/24"
+          ipv4.nat: true
+          ipv6.address: "none"
+      register: c2_result
+    - name: "C2: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c2_server
+    - name: "C2: the module creates it"
+      ansible.builtin.assert:
+        that:
+          - c2_result is changed
+          - c2_server.status == 200
+          - c2_server.json.metadata.config['ipv4.address'] == net_subnet ~ '.1/24'
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        description: "test bridge"
+        config:
+          ipv4.address: "{{ net_subnet }}.1/24"
+          ipv4.nat: true
+          ipv6.address: "none"
+      register: c3_result
+    - name: "C3: no change"
+      ansible.builtin.assert:
+        that:
+          - c3_result is not changed
+    - name: "C4: check mode predicts an update"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.nat: false
+      check_mode: true
+      diff: true
+      register: c4_result
+    - name: "C4: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c4_server
+    - name: "C4: change predicted, server unchanged"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.before != c4_result.diff.after
+          - c4_server.json.metadata.config['ipv4.nat'] == 'true'
+    - name: "C5: update one option"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.nat: false
+      register: c5_result
+    - name: "C5: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c5_server
+    - name: "C5: the server has the new value"
+      ansible.builtin.assert:
+        that:
+          - c5_result is changed
+          - c5_server.json.metadata.config['ipv4.nat'] == 'false'
+    - name: "C6: set a key with the API"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+        method: PATCH
+        body:
+          config:
+            user.other: "set-by-api"
+    - name: "C6: run without the key"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.nat: false
+      register: c6_result
+    - name: "C6: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c6_server
+    - name: "C6: merge keeps the key"
+      ansible.builtin.assert:
+        that:
+          - c6_result is not changed
+          - c6_server.json.metadata.config['user.other'] == 'set-by-api'
+    - name: "C7: config_mode exact"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.nat: false
+        config_mode: "exact"
+      register: c7_result
+    - name: "C7: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c7_server
+    - name: "C7: exact removes the unmanaged key"
+      ansible.builtin.assert:
+        that:
+          - c7_result is changed
+          - "'user.other' not in c7_server.json.metadata.config"
+          - c7_server.json.metadata.config['ipv4.address'] == net_subnet ~ '.1/24'
+    - name: "C8: set a key"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          user.temp: "1"
+      register: c8a_result
+    - name: "C8: remove it with null"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          user.temp: null
+      register: c8_result
+    - name: "C8: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c8_server
+    - name: "C8: null removes the key"
+      ansible.builtin.assert:
+        that:
+          - c8_result is changed
+          - "'user.temp' not in c8_server.json.metadata.config"
+    - name: "C9: bad input"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.nat:
+            - 1
+      register: c9_result
+      ignore_errors: true
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_result is failed
+          - '"must be a string, a number, or a boolean" in c9_result.msg'
+    - name: "N1: ipv4.address auto on an existing bridge"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        config:
+          ipv4.address: "auto"
+      register: n1_result
+    - name: "N1: auto makes no change"
+      ansible.builtin.assert:
+        that:
+          - n1_result is not changed
+    - name: "N4: a different type"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        type: "macvlan"
+      register: n4_result
+    - name: "N4: a type change gives a warning and no change"
+      ansible.builtin.assert:
+        that:
+          - n4_result is not changed
+          - n4_result.warnings | select('search', 'applies only on create') | list | length == 1
+    - name: "C10: check mode predicts a delete"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: "absent"
+      check_mode: true
+      register: c10_result
+    - name: "C10: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c10_server
+    - name: "C10: it still exists"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c10_server.status == 200
+    - name: "C11: delete"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: "absent"
+      register: c11_result
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ net_url }}"
+      register: c11_server
+    - name: "C11: it is gone"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_server.status == 404
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: "absent"
+      register: c12_result
+    - name: "C12: no change"
+      ansible.builtin.assert:
+        that:
+          - c12_result is not changed
+  always:
+    - name: Remove the test object
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: "absent"
+      failed_when: false

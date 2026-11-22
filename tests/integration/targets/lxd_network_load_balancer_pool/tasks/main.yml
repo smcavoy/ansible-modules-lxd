@@ -1,0 +1,258 @@
+# Goal: lxd_network_load_balancer_pool creates, updates, and deletes OVN load balancer pools, and a load balancer port reaches the pool.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_network_load_balancer_pool tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+      status_code: [200, 404]
+  vars:
+    net: "t{{ lxd_run_id }}lp"
+    vip: 10.250.201.10
+    pool_url: "{{ lxd_url }}/1.0/networks/{{ net }}/load-balancer-pools/web"
+    names:
+      - "t-{{ lxd_run_id }}-lp1"
+      - "t-{{ lxd_run_id }}-lp2"
+      - "t-{{ lxd_run_id }}-lpc"
+  block:
+    - name: Allow listen addresses on the uplink
+      smcavoy.lxd.lxd_network:
+        name: "{{ lxd_ovn_uplink }}"
+        config:
+          ipv4.routes: 10.250.201.0/24
+
+    - name: Create the OVN network
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        type: ovn
+        config:
+          network: "{{ lxd_ovn_uplink }}"
+
+    - name: Start two pool members and a client on the OVN network
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        source:
+          image: "{{ lxd_image_ct }}"
+        devices:
+          eth0:
+            type: nic
+            network: "{{ net }}"
+            name: eth0
+        wait_for:
+          - type: ipv4
+        wait_timeout: 240
+      loop: "{{ names }}"
+
+    - name: Start a server that answers with its name in each pool member
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ item }}"
+        command:
+          - sh
+          - -c
+          - >-
+            (while true; do printf 'HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{{ item[-3:] }}\n' | nc -l -p 80; done)
+            >/dev/null 2>&1 &
+      loop: "{{ names[:2] }}"
+
+    - name: "C1: check mode predicts a pool"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        config:
+          target_port: "80"
+        instances:
+          - name: "{{ names[0] }}"
+          - name: "{{ names[1] }}"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c1_server
+
+    - name: "C2: create the pool"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        description: web pool
+        config:
+          target_port: "80"
+        instances:
+          - name: "{{ names[0] }}"
+          - name: "{{ names[1] }}"
+      register: c2_result
+
+    - name: "C2: log the pool as LXD returns it"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT pool {{ c2_result.load_balancer_pool | to_json }}"
+
+    - name: "C3 and LP3: run C2 again with the instances in another order"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        description: web pool
+        config:
+          target_port: "80"
+        instances:
+          - name: "{{ names[1] }}"
+          - name: "{{ names[0] }}"
+      register: c3_result
+
+    - name: "C1 to C3: check mode does nothing, the pool exists, and a second run makes no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_server.status == 404
+          - c2_result is changed
+          - c2_result.load_balancer_pool.instances | length == 2
+          - c2_result.load_balancer_pool.description == 'web pool'
+          - c3_result is not changed
+
+    - name: "LP1: a load balancer port that targets the pool"
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        ports:
+          - protocol: tcp
+            listen_port: "80"
+            target_pool: web
+      register: lp1_balancer
+
+    - name: "LP1: ask the load balancer ten times from the client"
+      smcavoy.lxd.lxd_instance_exec:
+        instance: "{{ names[2] }}"
+        command:
+          - sh
+          - -c
+          - "for i in 1 2 3 4 5 6 7 8 9 10; do wget -q -T 3 -O- http://{{ vip }}/ || echo none; done"
+      register: lp1_result
+
+    - name: "LP1: log the answers"
+      ansible.builtin.debug:
+        msg: "LXDTEST-FACT pool-answers {{ lp1_result.stdout_lines | to_json }}"
+
+    - name: "LP1: the pool members answer"
+      ansible.builtin.assert:
+        that:
+          - lp1_balancer is changed
+          - lp1_result.stdout_lines | select('match', '^lp[12]$') | list | length > 0
+
+    - name: "C4 to C6: update the description, the health check, and the members"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        description: one member
+        config:
+          healthcheck.interval: "5"
+        instances:
+          - name: "{{ names[0] }}"
+      register: c6_result
+
+    - name: "C7: run C6 again"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        description: one member
+        config:
+          healthcheck.interval: "5"
+        instances:
+          - name: "{{ names[0] }}"
+      register: c7_result
+
+    - name: "B1: a create without target_port"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: other
+      register: b1_result
+      ignore_errors: true
+
+    - name: "C4 to C7 and B1: update, no change for a second run, and a clear error"
+      ansible.builtin.assert:
+        that:
+          - c6_result is changed
+          - c6_result.load_balancer_pool.description == 'one member'
+          - c6_result.load_balancer_pool.instances | length == 1
+          - c6_result.load_balancer_pool.config['target_port'] == '80'
+          - c7_result is not changed
+          - b1_result is failed
+          - "'target_port is required' in b1_result.msg"
+
+    - name: Remove the load balancer that uses the pool
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+
+    - name: "C11: delete the pool"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        state: absent
+      register: c11_result
+
+    - name: "C11: read the server"
+      ansible.builtin.uri:
+        url: "{{ pool_url }}"
+      register: c11_server
+
+    - name: "C12: delete again"
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        state: absent
+      register: c12_result
+
+    - name: "C11 and C12: delete, and no change for a second delete"
+      ansible.builtin.assert:
+        that:
+          - c11_result is changed
+          - c11_result.load_balancer_pool is none
+          - c11_server.status == 404
+          - c12_result is not changed
+  always:
+    - name: Remove the load balancer
+      smcavoy.lxd.lxd_network_load_balancer:
+        network: "{{ net }}"
+        listen_address: "{{ vip }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the pool
+      smcavoy.lxd.lxd_network_load_balancer_pool:
+        network: "{{ net }}"
+        name: web
+        state: absent
+      failed_when: false
+
+    - name: Remove the containers
+      smcavoy.lxd.lxd_instance:
+        name: "{{ item }}"
+        state: absent
+        force: true
+      loop: "{{ names }}"
+      failed_when: false
+
+    - name: Remove the OVN network
+      smcavoy.lxd.lxd_network:
+        name: "{{ net }}"
+        state: absent
+      failed_when: false
+
+    - name: Remove the uplink routes
+      smcavoy.lxd.lxd_network:
+        name: "{{ lxd_ovn_uplink }}"
+        config:
+          ipv4.routes: null
+      failed_when: false

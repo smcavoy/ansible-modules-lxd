@@ -1,0 +1,244 @@
+# Goal: lxd_trust_certificate adds, updates, and removes trust entries, and refuses to remove its own certificate.
+---
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Run the lxd_trust_certificate tests
+  module_defaults:
+    group/smcavoy.lxd.lxd:
+      url: "{{ lxd_url }}"
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      server_cert: "{{ lxd_server_cert }}"
+    ansible.builtin.uri:
+      client_cert: "{{ lxd_client_cert }}"
+      client_key: "{{ lxd_client_key }}"
+      ca_path: "{{ lxd_server_cert }}"
+      body_format: json
+  vars:
+    cert_url: "{{ lxd_url }}/1.0/certificates/{{ new_fp.stdout | lower | regex_replace('^.*=', '') | replace(':', '') }}"
+  block:
+    - name: Make a folder for a new client certificate
+      ansible.builtin.tempfile:
+        state: directory
+      register: cert_dir
+
+    - name: Make a new client certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - ec
+          - -pkeyopt
+          - ec_paramgen_curve:secp384r1
+          - -nodes
+          - -days
+          - "1"
+          - -subj
+          - /CN=t-{{ lxd_run_id }}-client
+          - -keyout
+          - "{{ cert_dir.path }}/client.key"
+          - -out
+          - "{{ cert_dir.path }}/client.crt"
+      changed_when: true
+
+    - name: Read the new certificate
+      ansible.builtin.set_fact:
+        new_cert: "{{ lookup('ansible.builtin.file', cert_dir.path ~ '/client.crt') }}"
+
+    # The fingerprint from openssl, not from the module, names the entry in the independent reads of the server.
+    - name: Compute the fingerprint of the new certificate
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "{{ cert_dir.path }}/client.crt", -noout, -fingerprint, -sha256]
+      changed_when: false
+      register: new_fp
+
+    - name: "C1: check mode predicts an add"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        name: "t-{{ lxd_run_id }}-trust"
+      check_mode: true
+      register: c1_result
+
+    - name: "C1: the server has no entry after check mode"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 404
+      register: c1_server
+      retries: 3
+      delay: 2
+      until: c1_server is not failed
+
+    - name: "C2: add the certificate, restricted to the default project"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        name: "t-{{ lxd_run_id }}-trust"
+        restricted: true
+        projects: [default]
+      register: c2_result
+
+    - name: "C2: read the entry from the server"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 200
+      register: c2_server
+      retries: 3
+      delay: 2
+      until: c2_server is not failed
+
+    - name: "C3: run C2 again"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        name: "t-{{ lxd_run_id }}-trust"
+        restricted: true
+        projects: [default]
+      register: c3_result
+
+    - name: "C1 to C3: check mode, add, and no change"
+      ansible.builtin.assert:
+        that:
+          - c1_result is changed
+          - c1_result.certificate.fingerprint | length == 64
+          - c2_result is changed
+          - c2_result.certificate.restricted is true
+          - c2_result.certificate.projects == ['default']
+          - c3_result is not changed
+          - c2_result.certificate.fingerprint == cert_url | basename
+          - c2_server.json.metadata.fingerprint == cert_url | basename
+          - c2_server.json.metadata.name == 't-' ~ lxd_run_id ~ '-trust'
+          - c2_server.json.metadata.type == 'client'
+          - c2_server.json.metadata.restricted is true
+          - c2_server.json.metadata.projects == ['default']
+          - c2_server.json.metadata.certificate | trim == new_cert | trim
+
+    - name: "C4: check mode predicts a rename"
+      smcavoy.lxd.lxd_trust_certificate:
+        fingerprint: "{{ c2_result.certificate.fingerprint }}"
+        name: "t-{{ lxd_run_id }}-renamed"
+        restricted: true
+        projects: [default]
+      check_mode: true
+      diff: true
+      register: c4_result
+
+    - name: "C4: read the entry from the server"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 200
+      register: c4_server
+      retries: 3
+      delay: 2
+      until: c4_server is not failed
+
+    - name: "C5: rename and remove the restriction, by fingerprint"
+      smcavoy.lxd.lxd_trust_certificate:
+        fingerprint: "{{ c2_result.certificate.fingerprint }}"
+        name: "t-{{ lxd_run_id }}-renamed"
+      register: c5_result
+
+    - name: "C5: read the entry from the server"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 200
+      register: c5_server
+      retries: 3
+      delay: 2
+      until: c5_server is not failed
+
+    - name: "C4 and C5: the diff and the change"
+      ansible.builtin.assert:
+        that:
+          - c4_result is changed
+          - c4_result.diff.after.name == 't-' ~ lxd_run_id ~ '-renamed'
+          - c5_result is changed
+          - c5_result.certificate.name == 't-' ~ lxd_run_id ~ '-renamed'
+          - c5_result.certificate.restricted is false
+          - c4_server.json.metadata.name == 't-' ~ lxd_run_id ~ '-trust'
+          - c4_server.json.metadata.restricted is true
+          - c5_server.json.metadata.name == 't-' ~ lxd_run_id ~ '-renamed'
+          - c5_server.json.metadata.restricted is false
+          - c5_server.json.metadata.projects == []
+          - c5_server.json.metadata.certificate | trim == new_cert | trim
+
+    - name: "C9: remove the certificate that the task connects with"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ lookup('ansible.builtin.file', lxd_client_cert) }}"
+        state: absent
+      register: c9_own
+      ignore_errors: true
+
+    - name: "C9: projects without restricted"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        projects: [default]
+      register: c9_projects
+      ignore_errors: true
+
+    - name: "C9: bad input fails with a clear message"
+      ansible.builtin.assert:
+        that:
+          - c9_own is failed
+          - "'lock the task out' in c9_own.msg"
+          - c9_projects is failed
+          - "'needs restricted' in c9_projects.msg"
+
+    - name: "C10: check mode predicts a remove"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        state: absent
+      check_mode: true
+      register: c10_result
+
+    - name: "C10: the server still has the entry after check mode"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 200
+      register: c10_server
+      retries: 3
+      delay: 2
+      until: c10_server is not failed
+
+    - name: "C11: remove the certificate"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        state: absent
+      register: c11_result
+
+    - name: "C11: the server has no entry after the remove"
+      ansible.builtin.uri:
+        url: "{{ cert_url }}"
+        status_code: 404
+      register: c11_server
+      retries: 3
+      delay: 2
+      until: c11_server is not failed
+
+    - name: "C12: remove again"
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        state: absent
+      register: c12_result
+
+    - name: "C10 to C12: check mode, remove, and no change for a second remove"
+      ansible.builtin.assert:
+        that:
+          - c10_result is changed
+          - c11_result is changed
+          - c11_result.certificate is none
+          - c12_result is not changed
+  always:
+    - name: Remove the test certificate
+      smcavoy.lxd.lxd_trust_certificate:
+        certificate: "{{ new_cert }}"
+        state: absent
+      when: new_cert is defined
+      failed_when: false
+
+    - name: Remove the certificate folder
+      ansible.builtin.file:
+        path: "{{ cert_dir.path }}"
+        state: absent
+      when: cert_dir.path is defined
