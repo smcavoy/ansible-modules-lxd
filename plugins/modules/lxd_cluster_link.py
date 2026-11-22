@@ -217,7 +217,6 @@ class ClusterLinkModule:
         current, etag = self.read()
         if current is None:
             self.create()
-            return
         warn_create_only(self.mod, current, {"type": current.get("type")})
         plan = plan_common(self.mod, current, FIELDS, COMPUTED_KEYS["cluster_link"])
         result: dict[str, t.Any] = {}

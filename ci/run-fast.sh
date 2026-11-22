@@ -52,8 +52,7 @@ fi
 
 # The nox lint session checks the collection code only. The CI code in ci/ and tests/lxd/lxdtest gets its own check.
 TOOLS="$(mktemp -d)"
-cleanup_tools() { rm -rf "$TOOLS"; }
-trap 'cleanup_tools; [ -n "${TMP:-}" ] && rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TOOLS"; [ -n "${TMP:-}" ] && rm -rf "$TMP"' EXIT
 if [ "${SKIP_TOOL_LINT:-}" != "1" ]; then
   python3 -m venv "$TOOLS/lint" && "$TOOLS/lint/bin/pip" install -q -r ci/requirements-fast.txt
   step "$TOOLS/lint/bin/ruff" check ci tests/lxd/lxdtest
