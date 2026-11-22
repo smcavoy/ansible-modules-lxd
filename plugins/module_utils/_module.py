@@ -130,7 +130,7 @@ class LXDModule:
         """Fail the task with O(msg)."""
         kwargs.update(self._extra())
         self.module.fail_json(msg=msg, **kwargs)
-        raise AssertionError("unreachable")  # pragma: no cover
+        raise AssertionError("unreachable")  # pragma: no cover  # pylint: disable=unreachable
 
     def warn(self, msg: str) -> None:
         """Add a warning to the result."""
@@ -173,7 +173,7 @@ class LXDModule:
             result["diff"] = {"before": dict(before or {}), "after": dict(after or {})}
         result.update(self._extra())
         self.module.exit_json(changed=changed, **result)
-        raise AssertionError("unreachable")  # pragma: no cover
+        raise AssertionError("unreachable")  # pragma: no cover  # pylint: disable=unreachable
 
     # ------------------------------------------------------------------
     # Requests
