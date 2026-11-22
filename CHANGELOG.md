@@ -2,20 +2,36 @@
 
 **Topics**
 
+- <a href="#v0-2-0">v0\.2\.0</a>
+    - <a href="#release-summary">Release Summary</a>
+    - <a href="#breaking-changes--porting-guide">Breaking Changes / Porting Guide</a>
 - <a href="#v0-1-3">v0\.1\.3</a>
     - <a href="#security-fixes">Security Fixes</a>
     - <a href="#bugfixes">Bugfixes</a>
 - <a href="#v0-1-2">v0\.1\.2</a>
-    - <a href="#release-summary">Release Summary</a>
+    - <a href="#release-summary-1">Release Summary</a>
     - <a href="#bugfixes-1">Bugfixes</a>
 - <a href="#v0-1-1">v0\.1\.1</a>
-    - <a href="#release-summary-1">Release Summary</a>
+    - <a href="#release-summary-2">Release Summary</a>
     - <a href="#security-fixes-1">Security Fixes</a>
     - <a href="#bugfixes-2">Bugfixes</a>
 - <a href="#v0-1-0">v0\.1\.0</a>
-    - <a href="#release-summary-2">Release Summary</a>
+    - <a href="#release-summary-3">Release Summary</a>
     - <a href="#bugfixes-3">Bugfixes</a>
     - <a href="#new-modules">New Modules</a>
+
+<a id="v0-2-0"></a>
+## v0\.2\.0
+
+<a id="release-summary"></a>
+### Release Summary
+
+The option <code>trust\_token</code> of <code>lxd\_cluster\_link</code> has the new name <code>link\_token</code>\. This is the first version on Ansible Galaxy\. Tested against LXD 6\.10\.1\.
+
+<a id="breaking-changes--porting-guide"></a>
+### Breaking Changes / Porting Guide
+
+* lxd\_cluster\_link \- the option <code>trust\_token</code> and the return value <code>trust\_token</code> have the new name <code>link\_token</code>\. The old name hid the connection option <code>trust\_token</code>\, which adds the client certificate to the trust store of the server\; that option now works in this module as in every other module\. Change <code>trust\_token</code> to <code>link\_token</code> in tasks that activate a link\, and <code>result\.trust\_token</code> to <code>result\.link\_token</code> where a task reads the token of a pending link\. A task that still gives only <code>trust\_token</code> makes a pending link and gets a warning \([https\://github\.com/smcavoy/ansible\-modules\-lxd/pull/2](https\://github\.com/smcavoy/ansible\-modules\-lxd/pull/2)\)\.
 
 <a id="v0-1-3"></a>
 ## v0\.1\.3
@@ -41,7 +57,7 @@
 <a id="v0-1-2"></a>
 ## v0\.1\.2
 
-<a id="release-summary"></a>
+<a id="release-summary-1"></a>
 ### Release Summary
 
 A bugfix release\. <code>lxd\_network</code> and <code>lxd\_storage\_pool</code> now fail on a network or a pool whose cluster create did not finish \(the status <code>Pending</code> or <code>Errored</code>\)\. Before\, they reported <code>ok</code> for an object that LXD cannot use\. Tested against LXD 6\.10\.1\.
@@ -54,7 +70,7 @@ A bugfix release\. <code>lxd\_network</code> and <code>lxd\_storage\_pool</code>
 <a id="v0-1-1"></a>
 ## v0\.1\.1
 
-<a id="release-summary-1"></a>
+<a id="release-summary-2"></a>
 ### Release Summary
 
 A bugfix release\. It has the fixes of a code review and the fix for file writes on a full disk\. Two tasks that reported a change on every run now fail with a clear message\, because LXD cannot do what they ask\: <code>lxd\_instance\_file</code> for a directory that exists with another owner or mode\, and <code>lxd\_image</code> with <code>expires\_at\=\"\"</code> on an image that has an expiry date\. Tested against LXD 6\.10\.1\.
@@ -87,7 +103,7 @@ A bugfix release\. It has the fixes of a code review and the fix for file writes
 <a id="v0-1-0"></a>
 ## v0\.1\.0
 
-<a id="release-summary-2"></a>
+<a id="release-summary-3"></a>
 ### Release Summary
 
 The first release of <code>smcavoy\.lxd</code>\: 63 modules for the LXD 6\.10 REST API\, with no Python dependency outside ansible\-core\. Tested against LXD 6\.10\.1 on standalone servers\, clusters\, linked clusters and MicroCloud \(OVN and Ceph\)\, on ansible\-core 2\.19 to 2\.22 and Python 3\.11 to 3\.13\.
