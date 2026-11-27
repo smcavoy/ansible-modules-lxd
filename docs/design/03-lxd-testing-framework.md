@@ -101,7 +101,8 @@ The runner builds the image `sandbox/<lxd version>` once per LXD version.
 Build steps:
 
 1. Launch `ubuntu:26.04` as a VM with 2 vCPU, 3 GiB, and `-d root,size=20GiB`.
-2. Install the `lxd` snap from channel `6/stable`. Hold refreshes.
+2. Install the `lxd` snap from the channel in `ci/lxd_remote.py` (`6/candidate` since 2026-11-27, for LXD 6.10.2). Hold
+   refreshes. Stop the build when the snap is older than `tests/lxd/sandbox/min-lxd-version`.
 3. Copy in the standalone preseed, the runner's client certificate, the first-boot script, and its systemd unit.
 4. Record the LXD snap revision in `/etc/lxdtest-version`.
 5. Check that `server.crt` and `server.key` do not exist in `/var/snap/lxd/common/lxd/`. Delete them if they exist.

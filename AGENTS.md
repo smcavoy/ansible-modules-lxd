@@ -70,6 +70,20 @@ change.
 - ansible-core 2.22 masks secrets on the controller. In a unit test the raw module output holds `invocation` and a
   `no_log` return value as they are, and names the secrets in `_ansible_new_secrets`.
 
+## The LXD version of the tests
+
+- Every sandbox of the integration suite runs LXD 6.10.2 or newer (since 2026-11-27). The suite no longer runs on
+  LXD 6.10.1. The collection still states "LXD 6.10.1 or newer"; that minimum has no test now.
+- `tests/lxd/sandbox/min-lxd-version` holds the minimum. The image build (`prepare.sh`) stops when the snap is older.
+  `tests/lxd/lxdtest` reads the snap of each sandbox, prints `sandbox <name>: LXD <version>, snap revision <n>,
+  channel <c>`, and fails the run (exit code 2) when one sandbox is older, also when all tests passed.
+- `DEFAULT_LXD_CHANNEL` in `ci/lxd_remote.py` is `6/candidate`: on 2026-11-27 `6/stable` had 6.10.1 (revision 41228)
+  and `6/candidate` had 6.10.2 (revision 41487). Set it back to `6/stable` when that channel has 6.10.2 or newer;
+  the guard fails the run when the change comes too early. `LXD_CI_LXD_CHANNEL` overrides the channel for one run.
+- The channel and the minimum are part of the sandbox image alias, so a change of either builds a new image.
+- The full suite (78 targets and scenarios) passes on LXD 6.10.2 with no change to a module or a test. No
+  difference in behaviour from 6.10.1 is known. The facts below were found on 6.10.1.
+
 ## LXD 6.10.1 behaviour that the code depends on
 
 - An expired `/operations/<id>/wait` slice answers HTTP 500 "context deadline exceeded"; the operation still runs.
