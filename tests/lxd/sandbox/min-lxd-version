@@ -1,0 +1,7 @@
+# Copyright (c) 2026, Sean McAvoy
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The oldest LXD version that a sandbox may run. One version on its own line.
+# The image build stops, and tests/lxd/lxdtest fails the run, when the LXD snap of a sandbox is older.
+6.10.2

@@ -5,6 +5,7 @@
 #
 # Build step 1 of the sandbox image. ci/bootstrap.py runs it in the build VM as root.
 # LXD_CHANNEL is the snap channel, for example 6/stable.
+# LXD_MIN_VERSION is the oldest LXD version that the image may have (the file min-lxd-version).
 # Every file in this folder is part of the image recipe. A change gives a new image name.
 set -eu
 cloud-init status --wait >/dev/null || true
@@ -15,6 +16,15 @@ else
   snap install lxd --channel="$LXD_CHANNEL"
 fi
 snap refresh --hold lxd
+# A channel can hold an older LXD than the tests need. Stop the build then: an image with an old LXD must not exist.
+lxd_version=$(snap list lxd | awk 'NR==2 {print $2}')
+lxd_revision=$(snap list lxd | awk 'NR==2 {print $3}')
+echo "LXD snap in the image: version $lxd_version, revision $lxd_revision, channel $LXD_CHANNEL"
+oldest=$(printf '%s\n%s\n' "${lxd_version%%-*}" "$LXD_MIN_VERSION" | sort -V | head -n 1)
+if [ "$oldest" != "$LXD_MIN_VERSION" ]; then
+  echo "the channel $LXD_CHANNEL gives LXD $lxd_version, which is older than $LXD_MIN_VERSION" >&2
+  exit 1
+fi
 
 # The MicroCloud fixture uses the snaps of the MicroCloud 3.4 LTS bundle: LXD 6, MicroCeph Tentacle, MicroOVN 26.03.
 # Their services stay off in every sandbox. The first-boot unit starts them only in MicroCloud mode.

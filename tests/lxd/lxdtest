@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import signal
 import socket
@@ -108,6 +109,15 @@ OVN_UPLINK_VLAN = 1000
 OVN_UPLINK_INTERFACE = "uplink0"
 OVN_UPLINK_GATEWAY = "10.251.0.1/24"
 OVN_UPLINK_RANGE = "10.251.0.100-10.251.0.199"
+# The oldest LXD version that a sandbox may run. The file is part of the sandbox image alias. A sandbox with an
+# older LXD fails the run: the tests must never run on an older LXD without a visible failure.
+MIN_LXD_VERSION = next(
+    line.strip()
+    for line in (Path(__file__).resolve().parent / "sandbox" / "min-lxd-version").read_text().splitlines()
+    if line.strip() and not line.startswith("#")
+)
+# The sandboxes of this run with an older LXD. L(Run.report) fails the run when the list is not empty.
+OLD_LXD: list[str] = []
 CALL_TIMEOUT = 600
 SANDBOX_READY_TIMEOUT = 300
 
@@ -120,6 +130,12 @@ def log(msg: str) -> None:
 
 class RunError(Exception):
     """A fixture step failed."""
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """Return the numbers of a snap version: C(6.10.2-fa810fd) gives (6, 10, 2). A version without numbers gives ()."""
+    found = re.match(r"\d+(?:\.\d+)*", text.strip())
+    return tuple(int(part) for part in found.group(0).split(".")) if found else ()
 
 
 # ----------------------------------------------------------------------
@@ -320,6 +336,7 @@ class Sandbox:
         self.image = image
         self.url = f"https://{name}:8443"
         self.ip = ""
+        self.lxd_checked = False
         self.cert = str(PKI / "client.crt")
         self.key = str(PKI / "client.key")
 
@@ -385,6 +402,7 @@ class Sandbox:
             try:
                 env = self.api("GET", "/1.0", timeout=10)
                 if (env.get("metadata") or {}).get("auth") == "trusted":
+                    self.check_lxd_version()
                     self.ip = socket.gethostbyname(self.name)
                     MONITOR.add(self)
                     return
@@ -393,6 +411,19 @@ class Sandbox:
                 last = str(exc)
             time.sleep(3)
         raise RunError(f"sandbox {self.name} did not become ready in {SANDBOX_READY_TIMEOUT} s: {last}")
+
+    def check_lxd_version(self) -> None:
+        """Print the LXD snap of the sandbox. Fail when it is older than MIN_LXD_VERSION, or when it cannot be read."""
+        if self.lxd_checked:
+            return
+        fields = self.host.exec(self.name, "snap list lxd | awk 'NR==2 {print $2, $3, $4}'", timeout=60).split()
+        version, revision, channel = (fields + ["?", "?", "?"])[:3]
+        log(f"sandbox {self.name}: LXD {version}, snap revision {revision}, channel {channel}")
+        if version_tuple(version) < version_tuple(MIN_LXD_VERSION):
+            text = f"sandbox {self.name} runs LXD {version} (snap revision {revision}, channel {channel}), which is older than {MIN_LXD_VERSION}"
+            OLD_LXD.append(text)
+            raise RunError(text)
+        self.lxd_checked = True
 
     def server_cert(self, path: Path) -> str:
         """Write the server certificate of the sandbox to O(path)."""
@@ -1050,12 +1081,14 @@ class MicroCloudSlot(Slot):
                 self.run.host.exec(member.name, "test -e /var/lib/lxd-sandbox/done", timeout=30)
                 member.ip = self.run.host.exec(member.name, "ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p'", timeout=30).strip()
                 if member.ip:
-                    return
+                    break
                 last = "no address yet"
             except RunError as exc:
                 last = str(exc)
             time.sleep(5)
-        raise RunError(f"member {member.name} did not finish its first boot in {SANDBOX_READY_TIMEOUT} s: {last}")
+        else:
+            raise RunError(f"member {member.name} did not finish its first boot in {SANDBOX_READY_TIMEOUT} s: {last}")
+        member.check_lxd_version()
 
     def preseed(self, subnet: str) -> str:
         """Return the MicroCloud preseed for all members."""
@@ -1423,6 +1456,11 @@ class Run:
         # The tests of such a slot ran on the other slots of its queue, or they are errors above.
         for slot in not_started:
             print(f"WARNING slot {slot.number} did not start, the run had fewer slots: {slot.start_error}")
+        for text in OLD_LXD:
+            print(f"ERROR {text}")
+        if OLD_LXD:
+            print(f"ERROR the run fails: every sandbox must run LXD {MIN_LXD_VERSION} or newer. Check the LXD channel of the sandbox image.")
+            return 2
         if counts["error"]:
             return 2
         if counts["fail"] or counts["timeout"]:
