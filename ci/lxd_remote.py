@@ -16,7 +16,7 @@ Environment:
   LXD_CI_RUNNER       The runner container. Default: lxdtest-runner.
   LXD_CI_LOCK_OWNER   Optional. The owner of a run lock that ci/bootstrap.py took for this job. The runner takes it over.
   LXD_CI_BASE_IMAGE   Optional. The base image of the sandbox image. Default: ubuntu:26.04.
-  LXD_CI_LXD_CHANNEL  Optional. The LXD snap channel of the sandbox image. Default: 6/stable.
+  LXD_CI_LXD_CHANNEL  Optional. The LXD snap channel of the sandbox image. Default: 6/candidate.
 
 The values of the three PEM variables can be the PEM text or a path to a file.
 """
@@ -49,7 +49,9 @@ FACT_MARKER = "LXDTEST-FACT"
 RETRY_MINUTES = 15
 SANDBOX_DIR = ROOT / "tests" / "lxd" / "sandbox"
 DEFAULT_BASE_IMAGE = "ubuntu:26.04"
-DEFAULT_LXD_CHANNEL = "6/stable"
+# 6/candidate has LXD 6.10.2 since 2026-11-26; 6/stable still has 6.10.1. Go back to 6/stable when it has
+# the version in tests/lxd/sandbox/min-lxd-version or a newer one.
+DEFAULT_LXD_CHANNEL = "6/candidate"
 
 
 def build_settings() -> tuple[str, str]:
