@@ -20,14 +20,20 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "lxd" / "lxdtest"
 
 
-@pytest.fixture
-def runner(monkeypatch: pytest.MonkeyPatch) -> t.Any:
-    """Return the runner script as a module, with the minimum 6.10.2 and an empty list of old sandboxes."""
-    loader = importlib.machinery.SourceFileLoader("lxdtest_version_under_test", str(SCRIPT))
+def load(name: str) -> t.Any:
+    """Return the runner script as a new module."""
+    loader = importlib.machinery.SourceFileLoader(name, str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def runner(monkeypatch: pytest.MonkeyPatch) -> t.Any:
+    """Return the runner script as a module, with the minimum 6.10.2 and an empty list of old sandboxes."""
+    module = load("lxdtest_version_under_test")
     monkeypatch.setattr(module, "MIN_LXD_VERSION", "6.10.2")
     monkeypatch.setattr(module, "OLD_LXD", [])
     return module
@@ -46,10 +52,9 @@ class SnapHost:
         return self.line
 
 
-def test_the_minimum_comes_from_the_image_recipe(runner):
+def test_the_minimum_comes_from_the_image_recipe():
     """The file is in the recipe folder, so a new minimum gives a new image alias."""
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("fresh", importlib.machinery.SourceFileLoader("fresh", str(SCRIPT))))
-    module.__spec__.loader.exec_module(module)
+    module = load("lxdtest_minimum_under_test")
     assert module.version_tuple(module.MIN_LXD_VERSION) >= (6, 10, 2)
     assert (SCRIPT.parent / "sandbox" / "min-lxd-version").is_file()
 
