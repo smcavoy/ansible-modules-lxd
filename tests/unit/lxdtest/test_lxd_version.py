@@ -62,7 +62,10 @@ def test_version_tuple(runner, text, numbers):
     assert runner.version_tuple(text) == numbers
 
 
-@pytest.mark.parametrize("line", ["6.10.2-fa810fd 41487 6/candidate\n", "6.10.3-0000000 50000 6/stable\n", "6.11-abc 50001 6/stable\n", "7.0.1-abc 60000 7/stable\n"])
+@pytest.mark.parametrize(
+    "line",
+    ["6.10.2-fa810fd 41487 6/candidate\n", "6.10.3-0000000 50000 6/stable\n", "6.11-abc 50001 6/stable\n", "7.0.1-abc 60000 7/stable\n"],
+)
 def test_a_new_enough_sandbox_passes_and_prints_its_snap(runner, capsys, line):
     host = SnapHost(line)
     sandbox = runner.Sandbox(host, "sbx-test-1", "sandbox/test")
@@ -74,7 +77,10 @@ def test_a_new_enough_sandbox_passes_and_prints_its_snap(runner, capsys, line):
     assert runner.OLD_LXD == []
 
 
-@pytest.mark.parametrize("line", ["6.10.1-f5c750d 41228 6/stable\n", "6.9-abc 30000 6/stable\n", "5.21.4-abc 20000 5.21/stable\n", "git-21e61d6 41468 6/edge\n", ""])
+@pytest.mark.parametrize(
+    "line",
+    ["6.10.1-f5c750d 41228 6/stable\n", "6.9-abc 30000 6/stable\n", "5.21.4-abc 20000 5.21/stable\n", "git-21e61d6 41468 6/edge\n", ""],
+)
 def test_an_old_or_unknown_lxd_fails_the_sandbox(runner, line):
     sandbox = runner.Sandbox(SnapHost(line), "sbx-test-1", "sandbox/test")
     with pytest.raises(runner.RunError, match="older than 6.10.2"):

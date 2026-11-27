@@ -667,7 +667,8 @@ class Bootstrap:
             self.lxd.state(name, "start")
             self.lxd.wait_exec(name, minutes=5)
             prepare = (SANDBOX_FILES / "prepare.sh").read_text()
-            self.lxd.run(name, prepare, env={"LXD_CHANNEL": self.args.lxd_channel, "LXD_MIN_VERSION": min_lxd_version()}, what="sandbox preparation", timeout_minutes=45)
+            build_env = {"LXD_CHANNEL": self.args.lxd_channel, "LXD_MIN_VERSION": min_lxd_version()}
+            self.lxd.run(name, prepare, env=build_env, what="sandbox preparation", timeout_minutes=45)
             self.lxd.push(name, "/etc/lxd-sandbox/preseed.yaml", (SANDBOX_FILES / "preseed.yaml").read_bytes())
             self.lxd.push(name, "/etc/lxd-sandbox/client.crt", self.client_pem)
             self.lxd.push(name, "/usr/local/sbin/lxd-sandbox-init", (SANDBOX_FILES / "lxd-sandbox-init").read_bytes(), mode="0755")
